@@ -32,6 +32,21 @@ THE SOFTWARE.
 #include <thread>
 #include <vector>
 
+#include <infiniband/verbs.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <arpa/inet.h>
+#include <assert.h>
+#include <fcntl.h>
+
+#define MAX_SEND_WR_PER_QP 12
+#define MAX_RECV_WR_PER_QP 12
+
+#define IB_PSN  0
+const uint64_t WR_ID = 1789;
+
 #if defined(__NVCC__)
 #include <cuda_runtime.h>
 #else
@@ -450,6 +465,30 @@ namespace TransferBench
       list.push_back(err);        \
     if (err.errType == ERR_FATAL) \
       return false;               \
+  } while (0)
+
+// Helper macro for calling RDMA functions and catching errors
+#define IBV_CALL(__func__, ...)                                      \
+  do {                                                               \
+    int error = __func__(__VA_ARGS__);                               \
+    if (error != 0) {                                                \
+      return {ERR_FATAL, "Encountered RDMA error (%d) at line (%d) " \
+              "and function (%s)", error, __LINE__, #__func__};      \
+    } else {                                                         \
+      return ERR_NONE;                                               \
+    }                                                                \
+  } while (0)
+
+// Helper macro for calling RDMA functions and catching nullptr errors
+#define IBV_PTR_CALL(__ptr__, __func__, ...)                            \
+  do {                                                                  \
+    __ptr__ = __func__(__VA_ARGS__);                                    \
+    if (__ptr__ == nullptr) {                                           \
+      return {ERR_FATAL, "Encountered RDMA nullptr error at line (%d) " \
+              "and function (%s)", error, __LINE__, #__func__};         \
+    } else {                                                            \
+      return ERR_NONE;                                                  \
+    }                                                                   \
   } while (0)
 
 namespace TransferBench
@@ -2074,6 +2113,359 @@ namespace {
       exeInfo.totalDurationMsec += deltaMsec;
     return ERR_NONE;
   }
+// IB Verbs-related functions
+//========================================================================================
+
+static ErrResult CreateQP(struct ibv_pd*  pd,
+                          struct ibv_cq*  cq,
+                          struct ibv_qp*& qp
+                         )
+{
+  struct ibv_qp_init_attr attr = {};
+  memset(&attr, 0, sizeof(struct ibv_qp_init_attr));
+  attr.send_cq = cq;
+  attr.recv_cq = cq;
+  attr.cap.max_send_wr  = MAX_SEND_WR_PER_QP;
+  attr.cap.max_recv_wr  = MAX_RECV_WR_PER_QP;
+  attr.cap.max_send_sge = 1;
+  attr.cap.max_recv_sge = 1;
+  attr.qp_type = IBV_QPT_RC;
+  qp = ibv_create_qp(pd, &attr);
+  if(qp == NULL)
+  {
+  return {ERR_FATAL, "Error while creating QP"};
+  }
+  else
+  {
+  return ERR_NONE;
+  }
+}
+
+static ErrResult SetIbvGid(struct ibv_context* ctx,
+                             uint8_t             port_num,
+                             int                 gid_index,
+                             ibv_gid&            gid
+                          )
+{
+  int ret = ibv_query_gid(ctx, port_num, gid_index, &gid);
+  if (ret != 0) {
+    return {ERR_FATAL, "Error while querying GID. IB Verbs Error code: %d", ret};
+  }
+  else {
+    return ERR_NONE;
+  }
+}
+
+static ErrResult TransitionQpToRtr(struct ibv_qp *qp,
+                                   uint16_t      dlid,
+                                   uint32_t      dqpn, 
+                                   ibv_gid       gid,
+                                   uint8_t       GidIndex,
+                                   uint8_t       port,
+                                   bool          isRoCE,
+                                   enum ibv_mtu  mtu
+                                  )
+{
+  struct ibv_qp_attr attr = {};
+  memset(&attr, 0, sizeof(struct ibv_qp_attr));
+  attr.qp_state       = IBV_QPS_RTR;
+  attr.path_mtu       = mtu;
+  attr.rq_psn         = IB_PSN;
+  attr.max_dest_rd_atomic = 1;
+  attr.min_rnr_timer  = 12;
+  if(isRoCE) {
+    attr.ah_attr.is_global = 1;
+    attr.ah_attr.grh.dgid.global.subnet_prefix = gid.global.subnet_prefix;
+    attr.ah_attr.grh.dgid.global.interface_id = gid.global.interface_id;
+    attr.ah_attr.grh.flow_label = 0;
+    attr.ah_attr.grh.sgid_index = GidIndex;
+    attr.ah_attr.grh.hop_limit = 255;
+  }
+  else {
+    attr.ah_attr.is_global = 0;
+    attr.ah_attr.dlid   = dlid;
+  }
+  attr.ah_attr.sl     = 0;
+  attr.ah_attr.src_path_bits = 0;
+  attr.ah_attr.port_num  = port;
+  attr.dest_qp_num    = dqpn;
+
+  int ret = ibv_modify_qp(qp, &attr,
+              IBV_QP_STATE              |
+              IBV_QP_AV                 |
+              IBV_QP_PATH_MTU           |
+              IBV_QP_DEST_QPN           |
+              IBV_QP_RQ_PSN             |
+              IBV_QP_MAX_DEST_RD_ATOMIC |
+              IBV_QP_MIN_RNR_TIMER);
+  if (ret != 0) {
+    return {ERR_FATAL, "Error during QP RTR. IB Verbs Error code: %d", ret};
+  }
+  else {
+    return ERR_NONE;
+  }
+}
+
+static ErrResult TransitionQpToRts(struct ibv_qp *qp)
+{
+  struct ibv_qp_attr attr = {};
+  memset(&attr, 0, sizeof(struct ibv_qp_attr));
+  attr.qp_state       = IBV_QPS_RTS;
+  attr.sq_psn         = IB_PSN;
+  attr.timeout        = 14;
+  attr.retry_cnt      = 7;
+  attr.rnr_retry      = 7;
+  attr.max_rd_atomic  = 1;
+
+  int ret = ibv_modify_qp(qp, &attr,
+            IBV_QP_STATE     |
+            IBV_QP_TIMEOUT   |
+            IBV_QP_RETRY_CNT |
+            IBV_QP_RNR_RETRY |
+            IBV_QP_SQ_PSN    |
+            IBV_QP_MAX_QP_RD_ATOMIC);
+  if (ret != 0) {
+    return {ERR_FATAL, "Error during QP RTS. IB Verbs Error code: %d", ret};
+  }
+  else {
+    return ERR_NONE;
+  }
+}
+
+static ErrResult  PollIbvCQ(struct ibv_cq     *cq,
+                            int               transferIdx,
+                            std::vector<bool> &sendRecvStat
+                           )
+{
+  int nc = 0;
+  struct ibv_wc wc;
+  // Loop until at least one completion is found
+  while (nc <= 0 && !sendRecvStat[transferIdx]) {
+    // Poll the completion queue
+    nc = ibv_poll_cq(cq, 1, &wc);
+     if(nc > 0) {
+      // Ensure the status of the work completion is successful
+      if(wc.status != IBV_WC_SUCCESS) {
+        return {ERR_FATAL, "Received unsuccessful IBV work completion"};
+      }
+      if(wc.wr_id == transferIdx) break;
+      else {
+        // Lock is not needed.  ibv_poll_cq is thread-safe
+        sendRecvStat[wc.wr_id] = true;
+        // reset to keep looping until my data is at least received
+        nc = 0;
+      }
+    }
+     // Ensure the number of completions polled is non-negative
+    if(nc < 0) {
+      return {ERR_FATAL, "Received negative IBV work completion. ibv_poll_cq returned %d", nc};
+    }
+  }
+  // No need to lock the shared vector. There are two cases
+  // 1. If my receive was accomplished by another thread, my loop won't exit
+  // unless unless the memory location has been sucessefully set by the receiving thread
+  // 2. If my receive was accomplished by my thread, then it is guaranteed that I am the only
+  // one trying to access this location
+  // All of this will change if ibv_poll_cq was not thread-safe
+  sendRecvStat[transferIdx] = false;
+  return ERR_NONE;
+}
+
+static bool IsConfiguredGid(union ibv_gid* gid)
+{
+  const struct in6_addr *a = (struct in6_addr *)gid->raw;
+  int trailer = (a->s6_addr32[1] | a->s6_addr32[2] | a->s6_addr32[3]);
+  if (((a->s6_addr32[0] | trailer) == 0UL) || 
+     ((a->s6_addr32[0] == htonl(0xfe800000)) && (trailer == 0UL))) {
+    return false;
+  }
+  return true;
+}
+
+static bool LinkLocalGid(union ibv_gid* gid)
+{
+  const struct in6_addr *a = (struct in6_addr *)gid->raw;
+  if (a->s6_addr32[0] == htonl(0xfe800000) && a->s6_addr32[1] == 0UL)
+  {
+    return true;
+  }
+  return false;
+}
+
+static bool isValidGid(union ibv_gid* gid)
+{
+  return (IsConfiguredGid(gid) && !LinkLocalGid(gid));
+}
+
+static sa_family_t GetGidAddressFamily(union ibv_gid* gid)
+{
+  const struct in6_addr *a = (struct in6_addr *)gid->raw;
+  bool isIpV4Mapped = ((a->s6_addr32[0] | a->s6_addr32[1]) |
+                       (a->s6_addr32[2] ^ htonl(0x0000ffff))) == 0UL;
+  bool isIpV4MappedMulticast = (a->s6_addr32[0] == htonl(0xff0e0000) &&
+                               ((a->s6_addr32[1] |
+                                (a->s6_addr32[2] ^ htonl(0x0000ffff))) == 0UL));
+  return (isIpV4Mapped || isIpV4MappedMulticast) ? AF_INET : AF_INET6;
+}
+
+static bool MatchGidAddressFamily(sa_family_t const& af,
+                                  void*              prefix,
+                                  int                prefixlen,
+                                  union ibv_gid*     gid
+                                 )
+{
+  struct in_addr *base = NULL;
+  struct in6_addr *base6 = NULL;
+  struct in6_addr *addr6 = NULL;;
+  if (af == AF_INET) {
+    base = (struct in_addr *)prefix;
+  } else {
+    base6 = (struct in6_addr *)prefix;
+  }
+  addr6 = (struct in6_addr *)gid->raw;
+
+#define NETMASK(bits) (htonl(0xffffffff ^ ((1 << (32 - bits)) - 1)))
+
+  int i = 0;
+  while (prefixlen > 0 && i < 4) {
+    if (af == AF_INET) {
+      int mask = NETMASK(prefixlen);
+      if ((base->s_addr & mask) ^ (addr6->s6_addr32[3] & mask)) {
+        break;
+      }
+      prefixlen = 0;
+      break;
+    } else {
+      if (prefixlen >= 32) {
+        if (base6->s6_addr32[i] ^ addr6->s6_addr32[i]) {
+          break;
+        }
+        prefixlen -= 32;
+        ++i;
+      } else {
+        int mask = NETMASK(prefixlen);
+        if ((base6->s6_addr32[i] & mask) ^ (addr6->s6_addr32[i] & mask)) {
+          break;
+        }
+        prefixlen = 0;
+      }
+    }
+  }
+
+  return (prefixlen == 0) ? true : false;
+}
+
+static ErrResult GetRoceVersionNumber(const char* deviceName,
+                                      int const&  portNum,
+                                      int const&  gidIndex,
+                                      int*        version
+                                     )
+  {
+  char gidRoceVerStr[16] = { 0 };
+  char roceTypePath[PATH_MAX] = { 0 };
+  sprintf(roceTypePath, "/sys/class/infiniband/%s/ports/%d/gid_attrs/types/%d",
+          deviceName, portNum, gidIndex);
+
+  int fd = open(roceTypePath, O_RDONLY);
+  if (fd == -1) {
+    return {ERR_FATAL, "Failed while opening RoCE file path (%s)", roceTypePath};
+  }
+
+  int ret = read(fd, gidRoceVerStr, 15);
+  close(fd);
+
+  if (ret == -1) {
+    return {ERR_FATAL, "Failed while reading RoCE version"};
+  }
+
+  if (strlen(gidRoceVerStr)) {
+    if (strncmp(gidRoceVerStr, "IB/RoCE v1", strlen("IB/RoCE v1")) == 0 
+     || strncmp(gidRoceVerStr, "RoCE v1", strlen("RoCE v1")) == 0) {
+      *version = 1;
+    }
+    else if (strncmp(gidRoceVerStr, "RoCE v2", strlen("RoCE v2")) == 0) {
+      *version = 2;
+    }
+  }
+
+  return ERR_NONE;
+}
+
+static ErrResult UpdateGidIndex(struct ibv_context* const& context,
+                                uint8_t const&             portNum,
+                                sa_family_t const&         af,
+                                void* const&               prefix,
+                                int const&                 prefixlen,
+                                int const&                 roceVer,
+                                int const&                 gidIndexCandidate,
+                                int*&                      gidIndex
+                                )
+{
+  union ibv_gid gid, gidCandidate;
+  IBV_CALL(ibv_query_gid, context, portNum, *gidIndex, &gid);
+  IBV_CALL(ibv_query_gid, context, portNum, gidIndexCandidate, &gidCandidate);
+
+  sa_family_t usrFam = af;
+  sa_family_t gidFam = GetGidAddressFamily(&gid);
+  sa_family_t gidCandidateFam = GetGidAddressFamily(&gidCandidate);
+  bool gidCandidateMatchSubnet = MatchGidAddressFamily(usrFam, prefix, prefixlen, &gidCandidate);
+
+  if (gidCandidateFam != gidFam && gidCandidateFam == usrFam && gidCandidateMatchSubnet) {
+    *gidIndex = gidIndexCandidate;
+  }
+  else {
+    if (gidCandidateFam != usrFam || !isValidGid(&gidCandidate) || !gidCandidateMatchSubnet) {
+      return ERR_NONE;
+    }
+    int usrRoceVer = roceVer;
+    int gidRoceVerNum, gidRoceVerNumCandidate;
+    const char* deviceName = ibv_get_device_name(context->device);
+    ErrResult err = GetRoceVersionNumber(deviceName, portNum, *gidIndex, &gidRoceVerNum);
+    if (err.errType != ERR_NONE) {
+      return err;
+    }
+    err = GetRoceVersionNumber(deviceName, portNum, gidIndexCandidate, &gidRoceVerNumCandidate);
+    if (err.errType != ERR_NONE) {
+      return err;
+    }
+    if ((gidRoceVerNum != gidRoceVerNumCandidate || !isValidGid(&gid)) && gidRoceVerNumCandidate == usrRoceVer)
+    {
+      *gidIndex = gidIndexCandidate;
+    }
+  }
+  return ERR_NONE;
+}
+
+static ErrResult SetGidIndex(struct ibv_context* context,
+                             uint8_t const&      portNum,
+                             int const&          gidTblLen,
+                             int const&          roceVersion,
+                             int const&          ipAddressFamily,
+                             int*                gidIndex
+                            )
+{
+  if (*gidIndex >= 0) {
+    return ERR_NONE;
+  }
+  sa_family_t userAddrFamily = (ipAddressFamily == 6)? AF_INET6 : AF_INET;
+
+  int userRoceVersion = roceVersion;
+
+  // TODO: Get address range from user
+  void *prefix = NULL;
+
+  *gidIndex = 0;
+  for (int gidIndexNext = 1; gidIndexNext < gidTblLen; ++gidIndexNext) {
+    ErrResult err = UpdateGidIndex(context, portNum, userAddrFamily,
+                                   prefix, 0, userRoceVersion, gidIndexNext,
+                                   gidIndex
+                                  );
+    if (err.errType != ERR_NONE) {
+      return err;
+    }
+  }
+  return ERR_NONE;
+}
 
 // Executor-related functions
 //========================================================================================
