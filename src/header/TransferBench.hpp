@@ -46,7 +46,7 @@ THE SOFTWARE.
 #include <fcntl.h>
 #define MAX_SEND_WR_PER_QP 12
 #define MAX_RECV_WR_PER_QP 12
-#define NETMASK(bits) (htonl(0xffffffff ^ ((1 << (32 - bits)) - 1)))
+
 #define IB_PSN  0
 const uint64_t WR_ID = 1789;
 static ibv_device** deviceList = nullptr;
@@ -490,7 +490,7 @@ namespace TransferBench
   do {                                                               \
     int error = __func__(__VA_ARGS__);                               \
     if (error != 0) {                                                \
-      return {ERR_FATAL, "Encountered RDMA error (%d) at line (%d) " \
+      return {ERR_FATAL, "Encountered IbVerbs error (%d) at line (%d) " \
               "and function (%s)", error, __LINE__, #__func__};      \
     } else {                                                         \
       return ERR_NONE;                                               \
@@ -502,7 +502,7 @@ namespace TransferBench
   do {                                                                  \
     __ptr__ = __func__(__VA_ARGS__);                                    \
     if (__ptr__ == nullptr) {                                           \
-      return {ERR_FATAL, "Encountered RDMA nullptr error at line (%d) " \
+      return {ERR_FATAL, "Encountered IbVerbs nullptr error at line (%d) " \
               "and function (%s)", __LINE__, #__func__};                \
     } else {                                                            \
       return ERR_NONE;                                                  \
@@ -1186,6 +1186,18 @@ namespace {
     uint32_t                   xccId;             ///< XCC ID
   };
 
+  // RDMA NIC resource 
+#ifdef RDMA_EXEC
+  struct NicResources
+  {
+    ibv_pd *protectionDomain = nullptr;        ///< Protection domain for RDMA operations
+    ibv_cq *completionQueue = nullptr;         ///< Completion queue for RDMA operations
+    ibv_context *context = nullptr;            ///< Device context for the RDMA capable NIC
+    ibv_port_attr portAttr = {};               ///< Port attributes for the RDMA capable NIC
+    ibv_gid gid;                               ///< GID handler
+  };
+#endif  
+
   // Internal resources allocated per Transfer
   struct TransferResources
   {
@@ -1208,14 +1220,7 @@ namespace {
 #endif
 
 #ifdef RDMA_EXEC
-    struct NicResources {
-      ibv_pd *protectionDomain = nullptr;        ///< Protection domain for RDMA operations
-      ibv_cq *completionQueue = nullptr;         ///< Completion queue for RDMA operations
-      ibv_context *context = nullptr;            ///< Device context for the RDMA capable NIC
-      ibv_port_attr portAttr = {};               ///< Port attributes for the RDMA capable NIC
-      ibv_gid gid;                               ///< GID handler
-    };
-    vector<NicResources*> resourceMapper;        ///< Store resoruce sensitive RDMA fields
+    vector<NicResources*> rdmaResourceMapper;    ///< Store resoruce sensitive RDMA fields
     vector<pair<ibv_mr *, void*>> sourceMr;      ///< Memory region for the source buffer
     vector<pair<ibv_mr *, void*>> destinationMr; ///< Memory region for the destination buffer
     vector<bool> receiveStatuses;                ///< Keep track of send/recv statuses
@@ -2154,11 +2159,12 @@ namespace {
 //========================================================================================
 
 #ifdef RDMA_EXEC
-static ErrResult CreateQP(struct ibv_pd*  pd,
-                          struct ibv_cq*  cq,
-                          struct ibv_qp*& qp
-                         )
+static ErrResult CreateQP(struct ibv_pd *pd,
+                          struct ibv_cq *cq,
+                          struct ibv_qp *& qp
+                        )
 {
+   
   struct ibv_qp_init_attr attr = {};
   memset(&attr, 0, sizeof(struct ibv_qp_init_attr));
   attr.send_cq = cq;
@@ -2179,19 +2185,38 @@ static ErrResult CreateQP(struct ibv_pd*  pd,
   }
 }
 
+static ErrResult InitQP(struct ibv_qp *qp, 
+                        uint8_t        port, 
+                        unsigned       flags)
+{
+  struct ibv_qp_attr attr = {};        // Initialize the QP attributes structure to zero
+  memset(&attr, 0, sizeof(struct ibv_qp_attr));
+  attr.qp_state   = IBV_QPS_INIT;      // Set the QP state to INIT
+  attr.pkey_index = 0;                 // Set the partition key index to 0
+  attr.port_num   = port;              // Set the port number to the defined IB_PORT
+  attr.qp_access_flags = flags;        // Set the QP access flags to the provided flags
+
+  // Modify the QP with the specified attributes and return the result
+  // int ret = ibv_modify_qp(qp, &attr,
+  //             IBV_QP_STATE      |      // Modify the QP state
+  //             IBV_QP_PKEY_INDEX |      // Modify the partition key index
+  //             IBV_QP_PORT       |      // Modify the port number
+  //             IBV_QP_ACCESS_FLAGS);    // Modify the access flags
+  IBV_CALL(ibv_modify_qp, qp, &attr,
+           IBV_QP_STATE      |       // Modify the QP state
+           IBV_QP_PKEY_INDEX |      // Modify the partition key index
+           IBV_QP_PORT       |      // Modify the port number
+           IBV_QP_ACCESS_FLAGS);    // Modify the access flags
+             
+}
+
 static ErrResult SetIbvGid(struct ibv_context* ctx,
                              uint8_t             port_num,
                              int                 gid_index,
                              ibv_gid&            gid
                           )
 {
-  int ret = ibv_query_gid(ctx, port_num, gid_index, &gid);
-  if (ret != 0) {
-    return {ERR_FATAL, "Error while querying GID. IB Verbs Error code: %d", ret};
-  }
-  else {
-    return ERR_NONE;
-  }
+  IBV_CALL(ibv_query_gid, ctx, port_num, gid_index, &gid);  
 }
 
 static ErrResult TransitionQpToRtr(struct ibv_qp *qp,
@@ -2361,7 +2386,7 @@ static bool MatchGidAddressFamily(sa_family_t const& af,
     base6 = (struct in6_addr *)prefix;
   }
   addr6 = (struct in6_addr *)gid->raw;
-
+#define NETMASK(bits) (htonl(0xffffffff ^ ((1 << (32 - bits)) - 1)))
   int i = 0;
   while (prefixlen > 0 && i < 4) {
     if (af == AF_INET) {
@@ -2519,6 +2544,150 @@ static ErrResult GetNicCount(int& NicCount)
     InitDeviceList();
   }
   NicCount = RdmaNicCount;
+  return ERR_NONE;
+}
+
+static ErrResult InitRdmaResources(int                   const& deviceID,
+                                   uint8_t               const& port,
+                                   vector<NicResources*> &      resourceMapper
+                                   ) 
+{
+  if (resourceMapper.size() <= deviceID) {
+    resourceMapper.resize(deviceID + 1);
+    resourceMapper[deviceID] = nullptr;
+  }
+  if (!resourceMapper[deviceID]) {
+    resourceMapper[deviceID] = new NicResources();
+    auto& rdma = resourceMapper[deviceID];
+    IBV_PTR_CALL(rdma->context, ibv_open_device, deviceList[deviceID]);
+    IBV_PTR_CALL(rdma->protectionDomain, ibv_alloc_pd, rdma->context);
+    IBV_PTR_CALL(rdma->completionQueue, ibv_create_cq, rdma->context, 100, NULL, NULL, 0);
+    IBV_CALL(ibv_query_port, rdma->context, port, &rdma->portAttr);
+    if (rdma->portAttr.state != IBV_PORT_ACTIVE) {      
+      return {ERR_FATAL, "Selected RDMA device %d is down", deviceID};
+    }
+  }
+  return ERR_NONE;
+}
+
+static ErrResult InitRdmaTransferResources(Transfer          const& transfer,
+                                           RdmaOptions       const& rdmaOptions,
+                                           TransferResources &      resources
+                                          )
+{
+  InitDeviceList();
+  const unsigned int rdmaFlags = IBV_ACCESS_LOCAL_WRITE  |
+                                IBV_ACCESS_REMOTE_READ    |
+                                IBV_ACCESS_REMOTE_WRITE   |
+                                IBV_ACCESS_REMOTE_ATOMIC;
+
+  auto && port            = rdmaOptions.ibPort;
+  
+  auto srcGidIndex        = rdmaOptions.ibGidIndex;
+  auto dstGidIndex        = rdmaOptions.ibGidIndex;  
+  auto && roceVersion     = rdmaOptions.roceVersion;
+  auto && ipAddrFamily    = rdmaOptions.ipAddressFamily;
+  auto && qpCount         = transfer.numSubExecs;
+  auto && srcDeviceId     = transfer.exeDevice.exeIndex;
+  auto && dstDeviceId     = transfer.exeDstIndex;
+  ERR_CHECK(InitRdmaResources(srcDeviceId, port, resources.rdmaResourceMapper));
+  ERR_CHECK(InitRdmaResources(dstDeviceId, port, resources.rdmaResourceMapper));
+  auto && srcRdmaResources    = resources.rdmaResourceMapper[srcDeviceId];
+  auto && dstRdmaResources    = resources.rdmaResourceMapper[dstDeviceId];
+  auto && senderQp            = resources.senderQp;
+  auto && receiverQp          = resources.receiverQp;
+  
+  bool isRoce = srcRdmaResources->portAttr.link_layer == IBV_LINK_LAYER_ETHERNET;
+  assert(srcRdmaResources->portAttr.link_layer == dstRdmaResources->portAttr.link_layer);
+  if(isRoce) {
+    ERR_CHECK(SetGidIndex(srcRdmaResources->context,
+                          port,
+                          srcRdmaResources->portAttr.gid_tbl_len,
+                          roceVersion,
+                          ipAddrFamily,
+                          &srcGidIndex
+                         )
+             );
+
+    ERR_CHECK(SetGidIndex(dstRdmaResources->context, 
+                          port, 
+                          dstRdmaResources->portAttr.gid_tbl_len,
+                          roceVersion,
+                          ipAddrFamily,
+                          &dstGidIndex
+                         )
+              );
+
+    ERR_CHECK(SetIbvGid(srcRdmaResources->context,
+                        port,
+                        srcGidIndex,
+                        srcRdmaResources->gid
+                       )
+             );
+
+    ERR_CHECK(SetIbvGid(dstRdmaResources->context,
+                        port,
+                        dstGidIndex,dstRdmaResources->gid
+                       )
+              );
+  }
+  
+  assert(senderQp == nullptr);
+  assert(receiverQp == nullptr);
+  assert(qpCount >= 1);
+  senderQp = new ibv_qp* [qpCount];
+  receiverQp = new ibv_qp* [qpCount];
+  for(int i = 0; i < qpCount; ++i) {
+    ERR_CHECK(CreateQP(srcRdmaResources->protectionDomain,
+                       srcRdmaResources->completionQueue, 
+                       senderQp[i]
+                      )
+             );
+
+    ERR_CHECK(CreateQP(dstRdmaResources->protectionDomain,
+                       dstRdmaResources->completionQueue,
+                       receiverQp[i]
+                      )
+             );
+
+    ERR_CHECK(InitQP(senderQp[i],
+                     port,
+                     rdmaFlags
+                    )
+             );
+    
+    ERR_CHECK(InitQP(receiverQp[i],
+                     port,
+                     rdmaFlags
+                    )
+             );
+
+    ERR_CHECK(TransitionQpToRtr(senderQp[i],
+                                dstRdmaResources->portAttr.lid,
+                                receiverQp[i]->qp_num,
+                                dstRdmaResources->gid,
+                                dstGidIndex,
+                                port,
+                                isRoce,
+                                srcRdmaResources->portAttr.active_mtu
+                                )
+             );
+
+    ERR_CHECK(TransitionQpToRts(senderQp[i]));
+
+    ERR_CHECK(TransitionQpToRtr(receiverQp[i],
+                                srcRdmaResources->portAttr.lid,
+                                senderQp[i]->qp_num,
+                                srcRdmaResources->gid,
+                                srcGidIndex,
+                                port,
+                                isRoce,
+                                dstRdmaResources->portAttr.active_mtu
+                                )
+              );
+
+    ERR_CHECK(TransitionQpToRts(receiverQp[i]));
+  }
   return ERR_NONE;
 }
 
