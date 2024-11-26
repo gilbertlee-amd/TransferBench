@@ -100,6 +100,12 @@ public:
   int outputToCsv;                   // Output in CSV format
   int samplingFactor;                // Affects how many different values of N are generated (when N set to 0)
 
+  // Rdma options
+  int ibGidIndex;                    // GID Index for RoCE NICs
+  int roceVersion;                   // RoCE version number
+  int ipAddressFamily;               // IP Address Famliy
+  uint8_t ibPort;                    // NIC port number to be used
+
   // Developer features
   int gpuMaxHwQueues;                // Tracks GPU_MAX_HW_QUEUES environment variable
 
@@ -146,6 +152,11 @@ public:
     useSingleStream   = GetEnvVar("USE_SINGLE_STREAM"   , 1);
     validateDirect    = GetEnvVar("VALIDATE_DIRECT"     , 0);
     validateSource    = GetEnvVar("VALIDATE_SOURCE"     , 0);
+   
+    ibGidIndex        = GetEnvVar("IB_GID_INDEX"        ,-1);
+    ibPort            = GetEnvVar("IB_PORT_NUMBER"      , 1);
+    roceVersion       = GetEnvVar("ROCE_VERSION"        , 2);
+    ipAddressFamily   = GetEnvVar("IP_ADDRESS_FAMILY"   , 4);
 
     gpuMaxHwQueues    = GetEnvVar("GPU_MAX_HW_QUEUES"   , 4);
 
@@ -299,6 +310,10 @@ public:
     printf(" USE_SINGLE_STREAM - Use a single stream per GPU GFX executor instead of stream per Transfer\n");
     printf(" VALIDATE_DIRECT   - Validate GPU destination memory directly instead of staging GPU memory on host\n");
     printf(" VALIDATE_SOURCE   - Validate GPU src memory immediately after preparation\n");
+    printf(" IB_GID_INDEX      - Required for RoCE NICs (default=3)\n");
+    printf(" IB_PORT_NUMBER    - RDMA port count for RDMA NIC (default=1)\n");
+    printf(" IP_ADDRESS_FAMILY - IP address family (4=v4, 6=v6, default=v4)\n");
+    printf(" ROCE_VERSION      - RoCE version (default=2)\n");
   }
 
   void Print(std::string const& name, int32_t const value, const char* format, ...) const
@@ -381,6 +396,14 @@ public:
           "Running in %s mode", useInteractive ? "interactive" : "non-interactive");
     Print("USE_SINGLE_STREAM", useSingleStream,
           "Using single stream per GFX %s", useSingleStream ? "device" : "Transfer");
+    Print("IB_GID_INDEX", ibGidIndex,
+          "RoCE GID index is set to %s", (ibGidIndex < 0 ? "auto" : std::to_string(ibGidIndex).c_str()));
+    Print("IB_PORT_NUMBER", ibPort,
+          "IB port number is set to %d", ibPort);
+    Print("ROCE_VERSION", roceVersion,
+          "RoCE version is set to %d", roceVersion);
+    Print("IP_ADDRESS_FAMILY", ipAddressFamily,
+          "IP address family is set to IPv%d", ipAddressFamily);
 
     if (getenv("XCC_PREF_TABLE")) {
       printf("%36s: Preferred XCC Table (XCC_PREF_TABLE)\n", "");
@@ -478,6 +501,11 @@ public:
     cfg.gfx.useMultiStream         = !useSingleStream;
     cfg.gfx.useSingleTeam          = gfxSingleTeam;
     cfg.gfx.waveOrder              = gfxWaveOrder;
+
+    cfg.rdma.ibGidIndex            = ibGidIndex;
+    cfg.rdma.ibPort                = ibPort;
+    cfg.rdma.ipAddressFamily       = ipAddressFamily;
+    cfg.rdma.roceVersion           = roceVersion;
 
     return cfg;
   }
