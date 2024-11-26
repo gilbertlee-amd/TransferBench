@@ -2191,7 +2191,7 @@ static ErrResult CreateQP(struct ibv_pd *pd,
   }
 }
 
-static ErrResult InitQP(struct ibv_qp *qp, 
+static ErrResult InitQP(struct ibv_qp* qp, 
                         uint8_t        port, 
                         unsigned       flags)
 {
@@ -2202,31 +2202,37 @@ static ErrResult InitQP(struct ibv_qp *qp,
   attr.port_num   = port;              // Set the port number to the defined IB_PORT
   attr.qp_access_flags = flags;        // Set the QP access flags to the provided flags
 
-  IBV_CALL(ibv_modify_qp, qp, &attr,
-           IBV_QP_STATE      |       // Modify the QP state
+  int ret = ibv_modify_qp(qp, &attr,
+           IBV_QP_STATE      |      // Modify the QP state
            IBV_QP_PKEY_INDEX |      // Modify the partition key index
            IBV_QP_PORT       |      // Modify the port number
            IBV_QP_ACCESS_FLAGS);    // Modify the access flags
-             
+  
+  if (ret != 0) {
+    return {ERR_FATAL, "Error during QP Init. IB Verbs Error code: %d", ret};
+  }
+  else {
+    return ERR_NONE;
+  }
 }
 
-static ErrResult SetIbvGid(struct ibv_context* ctx,
-                             uint8_t             port_num,
-                             int                 gid_index,
-                             ibv_gid&            gid
+static ErrResult SetIbvGid(ibv_context* const&  ctx,
+                           uint8_t      const&  portNum,
+                           int          const&  gidIndex,
+                           ibv_gid&             gid
                           )
 {
-  IBV_CALL(ibv_query_gid, ctx, port_num, gid_index, &gid);  
+  IBV_CALL(ibv_query_gid, ctx, portNum, gidIndex, &gid);  
 }
 
-static ErrResult TransitionQpToRtr(struct ibv_qp *qp,
-                                   uint16_t      dlid,
-                                   uint32_t      dqpn, 
-                                   ibv_gid       gid,
-                                   uint8_t       GidIndex,
-                                   uint8_t       port,
-                                   bool          isRoCE,
-                                   enum ibv_mtu  mtu
+static ErrResult TransitionQpToRtr(ibv_qp*         qp,
+                                   uint16_t const& dlid,
+                                   uint32_t const& dqpn, 
+                                   ibv_gid  const& gid,
+                                   uint8_t  const& gidIndex,
+                                   uint8_t  const& port,
+                                   bool     const& isRoCE,
+                                   ibv_mtu  const& mtu
                                   )
 {
   struct ibv_qp_attr attr = {};
@@ -2241,7 +2247,7 @@ static ErrResult TransitionQpToRtr(struct ibv_qp *qp,
     attr.ah_attr.grh.dgid.global.subnet_prefix = gid.global.subnet_prefix;
     attr.ah_attr.grh.dgid.global.interface_id = gid.global.interface_id;
     attr.ah_attr.grh.flow_label = 0;
-    attr.ah_attr.grh.sgid_index = GidIndex;
+    attr.ah_attr.grh.sgid_index = gidIndex;
     attr.ah_attr.grh.hop_limit = 255;
   }
   else {
@@ -2295,9 +2301,9 @@ static ErrResult TransitionQpToRts(struct ibv_qp *qp)
   }
 }
 
-static ErrResult  PollIbvCQ(struct ibv_cq     *cq,
-                            int               transferIdx,
-                            std::vector<bool> &sendRecvStat
+static ErrResult  PollIbvCQ(struct ibv_cq*     cq,
+                            int                transferIdx,
+                            std::vector<bool>& sendRecvStat
                            )
 {
   int nc = 0;
@@ -2481,14 +2487,8 @@ static ErrResult UpdateGidIndex(struct ibv_context* const& context,
     int usrRoceVer = roceVer;
     int gidRoceVerNum, gidRoceVerNumCandidate;
     const char* deviceName = ibv_get_device_name(context->device);
-    ErrResult err = GetRoceVersionNumber(deviceName, portNum, *gidIndex, &gidRoceVerNum);
-    if (err.errType != ERR_NONE) {
-      return err;
-    }
-    err = GetRoceVersionNumber(deviceName, portNum, gidIndexCandidate, &gidRoceVerNumCandidate);
-    if (err.errType != ERR_NONE) {
-      return err;
-    }
+    ERR_CHECK(GetRoceVersionNumber(deviceName, portNum, *gidIndex, &gidRoceVerNum));    
+    ERR_CHECK(GetRoceVersionNumber(deviceName, portNum, gidIndexCandidate, &gidRoceVerNumCandidate));    
     if ((gidRoceVerNum != gidRoceVerNumCandidate || !isValidGid(&gid)) && gidRoceVerNumCandidate == usrRoceVer)
     {
       *gidIndex = gidIndexCandidate;
