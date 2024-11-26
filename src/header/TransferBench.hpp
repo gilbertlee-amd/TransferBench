@@ -32,6 +32,10 @@ THE SOFTWARE.
 #include <thread>
 #include <vector>
 
+
+#define RDMA_EXEC
+
+#ifdef RDMA_EXEC
 #include <infiniband/verbs.h>
 #include <stdio.h>
 #include <string.h>
@@ -40,12 +44,14 @@ THE SOFTWARE.
 #include <arpa/inet.h>
 #include <assert.h>
 #include <fcntl.h>
-
 #define MAX_SEND_WR_PER_QP 12
 #define MAX_RECV_WR_PER_QP 12
-
+#define NETMASK(bits) (htonl(0xffffffff ^ ((1 << (32 - bits)) - 1)))
 #define IB_PSN  0
 const uint64_t WR_ID = 1789;
+static ibv_device** deviceList = nullptr;
+static int RdmaNicCount        = -1;
+#endif
 
 #if defined(__NVCC__)
 #include <cuda_runtime.h>
@@ -172,6 +178,17 @@ namespace TransferBench
   };
 
   /**
+   * RDMA Executor options
+   */
+  struct RdmaOptions
+  {
+    int ibGidIndex   =-1;                       ///< GID Index for RoCE NICs (-1 is auto)
+    int roceVersion  = 2;                       ///< RoCE version (used for auto GID detection)
+    int ipAddressFamily = 4;                    ///< 4=IPv4, 6=IPv6 (used for auto GID detection)
+    uint8_t ibPort   = 1;                       ///< NIC port number to be used
+  };
+
+  /**
    * GFX Executor options
    */
   struct GfxOptions
@@ -196,6 +213,7 @@ namespace TransferBench
 
     GfxOptions     gfx;                         ///< GFX executor options
     DmaOptions     dma;                         ///< DMA executor options
+    RdmaOptions    rdma;                        ///< RDMA executor options
   };
 
   /**
@@ -485,7 +503,7 @@ namespace TransferBench
     __ptr__ = __func__(__VA_ARGS__);                                    \
     if (__ptr__ == nullptr) {                                           \
       return {ERR_FATAL, "Encountered RDMA nullptr error at line (%d) " \
-              "and function (%s)", error, __LINE__, #__func__};         \
+              "and function (%s)", __LINE__, #__func__};                \
     } else {                                                            \
       return ERR_NONE;                                                  \
     }                                                                   \
@@ -1189,6 +1207,24 @@ namespace {
     hsa_amd_sdma_engine_id_t   sdmaEngineId;      ///< DMA engine ID
 #endif
 
+#ifdef RDMA_EXEC
+    struct NicResources {
+      ibv_pd *protectionDomain = nullptr;        ///< Protection domain for RDMA operations
+      ibv_cq *completionQueue = nullptr;         ///< Completion queue for RDMA operations
+      ibv_context *context = nullptr;            ///< Device context for the RDMA capable NIC
+      ibv_port_attr portAttr = {};               ///< Port attributes for the RDMA capable NIC
+      ibv_gid gid;                               ///< GID handler
+    };
+    vector<NicResources*> resourceMapper;        ///< Store resoruce sensitive RDMA fields
+    vector<pair<ibv_mr *, void*>> sourceMr;      ///< Memory region for the source buffer
+    vector<pair<ibv_mr *, void*>> destinationMr; ///< Memory region for the destination buffer
+    vector<bool> receiveStatuses;                ///< Keep track of send/recv statuses
+    vector<size_t> messageSizes;                 ///< Keep track of message sizes
+    ibv_qp **senderQp = nullptr;                 ///< Queue pair for sending RDMA requests
+    ibv_qp **receiverQp = nullptr;               ///< Queue pair for receiving RDMA requests    
+    int port;                                    ///< Port ID
+    uint8_t qpCount;                             ///< Number of QPs to be used for transferring data
+#endif
     // Counters
     double                     totalDurationMsec; ///< Total duration for all iterations for this Transfer
     vector<double>             perIterMsec;       ///< Duration for each individual iteration
@@ -2113,9 +2149,11 @@ namespace {
       exeInfo.totalDurationMsec += deltaMsec;
     return ERR_NONE;
   }
+
 // IB Verbs-related functions
 //========================================================================================
 
+#ifdef RDMA_EXEC
 static ErrResult CreateQP(struct ibv_pd*  pd,
                           struct ibv_cq*  cq,
                           struct ibv_qp*& qp
@@ -2324,8 +2362,6 @@ static bool MatchGidAddressFamily(sa_family_t const& af,
   }
   addr6 = (struct in6_addr *)gid->raw;
 
-#define NETMASK(bits) (htonl(0xffffffff ^ ((1 << (32 - bits)) - 1)))
-
   int i = 0;
   while (prefixlen > 0 && i < 4) {
     if (af == AF_INET) {
@@ -2466,6 +2502,27 @@ static ErrResult SetGidIndex(struct ibv_context* context,
   }
   return ERR_NONE;
 }
+
+static ErrResult InitDeviceList() 
+{
+  if (deviceList == NULL) 
+  {
+    IBV_PTR_CALL(deviceList, ibv_get_device_list, &RdmaNicCount);
+  }
+  return ERR_NONE;
+}
+
+static ErrResult GetNicCount(int& NicCount)
+{
+  if (deviceList == NULL && RdmaNicCount < 0)
+  {
+    InitDeviceList();
+  }
+  NicCount = RdmaNicCount;
+  return ERR_NONE;
+}
+
+#endif // end of the RDMA_EXEC utils 
 
 // Executor-related functions
 //========================================================================================
