@@ -76,10 +76,12 @@ namespace TransferBench
     EXE_GPU_GFX      = 1,                       ///<  GPU kernel-based executor (subExecutor = threadblock/CU)
     EXE_GPU_DMA      = 2,                       ///<  GPU SDMA executor         (subExecutor = not supported)
     EXE_IBV          = 3,                       ///<  IBVerbs executor          (subExecutor = queue pair)
+    EXE_IBV_NEAREST  = 4                        ///<  IBVerbs nearest executor  (subExecutor = queue pair)
   };
-  char const ExeTypeStr[5] = "CGDI";
+  char const ExeTypeStr[6] = "CGDIN";
   inline bool IsCpuExeType(ExeType e){ return e == EXE_CPU; }
   inline bool IsGpuExeType(ExeType e){ return e == EXE_GPU_GFX || e == EXE_GPU_DMA; }
+  inline bool IsRdmaExeType(ExeType e){ return e == EXE_IBV || e == EXE_IBV_NEAREST; }
 
   /**
    * A ExeDevice defines a specific Executor
@@ -1066,7 +1068,7 @@ namespace {
           }
         }
         break;
-      case EXE_IBV:
+      case EXE_IBV: case EXE_IBV_NEAREST:
         errors.push_back({ERR_FATAL, "Transfer %d: IBV executor currently not supported", i});
         break;
       }
@@ -2574,8 +2576,7 @@ static ErrResult InitRdmaTransferResources(Transfer          const& transfer,
                                           )
 {
   InitDeviceList();  
-  auto && port            = rdmaOptions.ibPort;
-  
+  auto && port            = rdmaOptions.ibPort;  
   auto srcGidIndex        = rdmaOptions.ibGidIndex;
   auto dstGidIndex        = rdmaOptions.ibGidIndex;  
   auto && roceVersion     = rdmaOptions.roceVersion;
@@ -2585,10 +2586,10 @@ static ErrResult InitRdmaTransferResources(Transfer          const& transfer,
   auto && dstDeviceId     = transfer.exeDstIndex;
   ERR_CHECK(InitRdmaResources(srcDeviceId, port, resources.rdmaResourceMapper));
   ERR_CHECK(InitRdmaResources(dstDeviceId, port, resources.rdmaResourceMapper));
-  auto && srcRdmaResources    = resources.rdmaResourceMapper[srcDeviceId];
-  auto && dstRdmaResources    = resources.rdmaResourceMapper[dstDeviceId];
-  auto && senderQp            = resources.senderQp;
-  auto && receiverQp          = resources.receiverQp;
+  auto && srcRdmaResources = resources.rdmaResourceMapper[srcDeviceId];
+  auto && dstRdmaResources = resources.rdmaResourceMapper[dstDeviceId];
+  auto && senderQp         = resources.senderQp;
+  auto && receiverQp       = resources.receiverQp;
   
   bool isRoce = srcRdmaResources->portAttr.link_layer == IBV_LINK_LAYER_ETHERNET;
   assert(srcRdmaResources->portAttr.link_layer == dstRdmaResources->portAttr.link_layer);
@@ -2622,13 +2623,13 @@ static ErrResult InitRdmaTransferResources(Transfer          const& transfer,
                         port,
                         dstGidIndex,dstRdmaResources->gid
                        )
-              );
+             );
   }
   
   assert(senderQp == nullptr);
   assert(receiverQp == nullptr);
   assert(qpCount >= 1);
-  senderQp = new ibv_qp* [qpCount];
+  senderQp   = new ibv_qp* [qpCount];
   receiverQp = new ibv_qp* [qpCount];
   for(int i = 0; i < qpCount; ++i) {
     ERR_CHECK(CreateQP(srcRdmaResources->protectionDomain,
@@ -2684,16 +2685,16 @@ static ErrResult InitRdmaTransferResources(Transfer          const& transfer,
   return ERR_NONE;
 }
 // using namespace TransferBench;
-static ErrResult RdmaRegisterMemoryTransfer(TransferResources &      resources,
+static ErrResult RegisterRdmaMemoryTransfer(TransferResources &      resources,
                                             Transfer          const& transfer,
                                             int               & transferId
                                            )
 {
   auto && srcDeviceId     = transfer.exeDevice.exeIndex;
   auto && dstDeviceId     = transfer.exeDstIndex;
-  auto && qpCount = transfer.numSubExecs;
-  auto&& srcRdmaResource = resources.rdmaResourceMapper[srcDeviceId];
-  auto&& dstRdmaResource = resources.rdmaResourceMapper[dstDeviceId];
+  auto && qpCount         = transfer.numSubExecs;
+  auto && srcRdmaResource = resources.rdmaResourceMapper[srcDeviceId];
+  auto && dstRdmaResource = resources.rdmaResourceMapper[dstDeviceId];
   struct ibv_mr *src_mr;
   struct ibv_mr *dst_mr;  
   IBV_PTR_CALL(src_mr,
@@ -2718,13 +2719,12 @@ static ErrResult RdmaRegisterMemoryTransfer(TransferResources &      resources,
   return ERR_NONE;
 }
 
-static ErrResult TransferRdma(TransferResources &      resources,
-                              Transfer          const& transfer,
-                              int               & transferIdx
+static ErrResult TransferRdma(TransferResources & resources,
+                              int               const& srcDeviceId,
+                              int               const& transferIdx, 
+                              int               const& qpCount
                              )
-{
-  auto && srcDeviceId     = transfer.exeDevice.exeIndex;  
-  auto && qpCount         = transfer.numSubExecs;
+{  
   assert((transferIdx % qpCount) == 0);
   uint64_t memIndex = transferIdx / qpCount;
   auto && srcRdmaResource = resources.rdmaResourceMapper[srcDeviceId];
@@ -2754,6 +2754,89 @@ static ErrResult TransferRdma(TransferResources &      resources,
   return ERR_NONE;
 }
 
+static ErrResult TeardownRdma(TransferResources & resources,
+                              int               const& srcDeviceId,
+                              int               const& dstDeviceId,
+                              int               const& qpCount
+                             )
+{
+  auto&& sourceMr   = resources.sourceMr;
+  auto&& dstMr      = resources.destinationMr;
+  auto&& senderQp   = resources.senderQp;
+  auto&& receiverQp = resources.receiverQp;
+  if (sourceMr.size() > 0) 
+  {
+    for(auto mr : sourceMr) 
+    {
+      IBV_CALL(ibv_dereg_mr, mr.first);
+    }
+    sourceMr.clear();
+  }
+  if (dstMr.size() > 0) 
+  {
+    for(auto mr : dstMr) 
+    {
+      IBV_CALL(ibv_dereg_mr, mr.first);
+    }
+    dstMr.clear();
+  }
+  resources.receiveStatuses.clear();
+  resources.messageSizes.clear();
+  
+  if (senderQp) 
+  {
+    for (int i = 0; i < qpCount; ++i) {
+      IBV_CALL(ibv_destroy_qp, senderQp[i]);
+      senderQp[i] = nullptr;
+    }
+    delete[] senderQp;
+    senderQp = nullptr;
+  }
+  if (receiverQp) 
+  {
+    for (int i = 0; i < qpCount; ++i) {
+      IBV_CALL(ibv_destroy_qp, receiverQp[i]);
+      receiverQp[i] = nullptr;
+    }
+    delete[] receiverQp;
+    receiverQp = nullptr;
+  }
+  auto& srcRdmaResource = resources.rdmaResourceMapper[srcDeviceId];
+  auto& dstRdmaResource = resources.rdmaResourceMapper[dstDeviceId];
+
+  if (srcRdmaResource != nullptr) {
+    if (srcRdmaResource->completionQueue) {
+      IBV_CALL(ibv_destroy_cq, srcRdmaResource->completionQueue);
+      srcRdmaResource->completionQueue = nullptr;
+    }
+    if (srcRdmaResource->protectionDomain) {
+      IBV_CALL(ibv_dealloc_pd, srcRdmaResource->protectionDomain);
+      srcRdmaResource->protectionDomain = nullptr;
+    }
+    if (srcRdmaResource->context) {
+      IBV_CALL(ibv_close_device, srcRdmaResource->context);
+      srcRdmaResource->context = nullptr;
+    }
+    srcRdmaResource = nullptr;
+  }
+
+  if (dstRdmaResource != nullptr) {
+    if (dstRdmaResource->completionQueue) {
+      IBV_CALL(ibv_destroy_cq, dstRdmaResource->completionQueue);
+      dstRdmaResource->completionQueue = nullptr;
+    }
+    if (dstRdmaResource->protectionDomain) {
+      IBV_CALL(ibv_dealloc_pd, dstRdmaResource->protectionDomain);
+      dstRdmaResource->protectionDomain = nullptr;
+    }
+    if (dstRdmaResource->context) {
+      IBV_CALL(ibv_close_device, dstRdmaResource->context);
+      dstRdmaResource->context = nullptr;
+    }
+    dstRdmaResource = nullptr;
+  }
+  return ERR_NONE;
+}
 #endif // end of the RDMA_EXEC code 
 
 // Executor-related functions
