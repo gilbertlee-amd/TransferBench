@@ -44,13 +44,6 @@ THE SOFTWARE.
 #include <arpa/inet.h>
 #include <assert.h>
 #include <fcntl.h>
-#define MAX_SEND_WR_PER_QP 12
-#define MAX_RECV_WR_PER_QP 12
-
-#define IB_PSN  0
-const uint64_t WR_ID = 1789;
-static ibv_device** deviceList = nullptr;
-static int RdmaNicCount        = -1;
 #endif
 
 #if defined(__NVCC__)
@@ -2159,6 +2152,17 @@ namespace {
 //========================================================================================
 
 #ifdef RDMA_EXEC
+#define MAX_SEND_WR_PER_QP 12
+#define MAX_RECV_WR_PER_QP 12
+const unsigned int rdmaFlags = IBV_ACCESS_LOCAL_WRITE    |
+                               IBV_ACCESS_REMOTE_READ    |
+                               IBV_ACCESS_REMOTE_WRITE   |
+                               IBV_ACCESS_REMOTE_ATOMIC;
+#define IB_PSN  0
+const  uint64_t WR_ID = 1789;
+static ibv_device** deviceList = nullptr;
+static int RdmaNicCount        = -1;
+
 static ErrResult CreateQP(struct ibv_pd *pd,
                           struct ibv_cq *cq,
                           struct ibv_qp *& qp
@@ -2196,12 +2200,6 @@ static ErrResult InitQP(struct ibv_qp *qp,
   attr.port_num   = port;              // Set the port number to the defined IB_PORT
   attr.qp_access_flags = flags;        // Set the QP access flags to the provided flags
 
-  // Modify the QP with the specified attributes and return the result
-  // int ret = ibv_modify_qp(qp, &attr,
-  //             IBV_QP_STATE      |      // Modify the QP state
-  //             IBV_QP_PKEY_INDEX |      // Modify the partition key index
-  //             IBV_QP_PORT       |      // Modify the port number
-  //             IBV_QP_ACCESS_FLAGS);    // Modify the access flags
   IBV_CALL(ibv_modify_qp, qp, &attr,
            IBV_QP_STATE      |       // Modify the QP state
            IBV_QP_PKEY_INDEX |      // Modify the partition key index
@@ -2575,12 +2573,7 @@ static ErrResult InitRdmaTransferResources(Transfer          const& transfer,
                                            TransferResources &      resources
                                           )
 {
-  InitDeviceList();
-  const unsigned int rdmaFlags = IBV_ACCESS_LOCAL_WRITE  |
-                                IBV_ACCESS_REMOTE_READ    |
-                                IBV_ACCESS_REMOTE_WRITE   |
-                                IBV_ACCESS_REMOTE_ATOMIC;
-
+  InitDeviceList();  
   auto && port            = rdmaOptions.ibPort;
   
   auto srcGidIndex        = rdmaOptions.ibGidIndex;
@@ -2690,8 +2683,78 @@ static ErrResult InitRdmaTransferResources(Transfer          const& transfer,
   }
   return ERR_NONE;
 }
+// using namespace TransferBench;
+static ErrResult RdmaRegisterMemoryTransfer(TransferResources &      resources,
+                                            Transfer          const& transfer,
+                                            int               & transferId
+                                           )
+{
+  auto && srcDeviceId     = transfer.exeDevice.exeIndex;
+  auto && dstDeviceId     = transfer.exeDstIndex;
+  auto && qpCount = transfer.numSubExecs;
+  auto&& srcRdmaResource = resources.rdmaResourceMapper[srcDeviceId];
+  auto&& dstRdmaResource = resources.rdmaResourceMapper[dstDeviceId];
+  struct ibv_mr *src_mr;
+  struct ibv_mr *dst_mr;  
+  IBV_PTR_CALL(src_mr,
+               ibv_reg_mr,
+               srcRdmaResource->protectionDomain,
+               resources.srcMem[0],
+               resources.numBytes,
+               rdmaFlags);
+  IBV_PTR_CALL(dst_mr, 
+               ibv_reg_mr,
+               dstRdmaResource->protectionDomain,
+               resources.dstMem[0],
+               resources.numBytes,
+               rdmaFlags);
+  resources.sourceMr.push_back(std::make_pair(src_mr, resources.srcMem[0]));
+  resources.destinationMr.push_back(std::make_pair(dst_mr, resources.dstMem[0]));
+  for(int i = 0; i < qpCount; ++i) {
+    resources.receiveStatuses.push_back(false);
+  }
+  resources.messageSizes.push_back(resources.numBytes);
+  transferId = resources.receiveStatuses.size() - qpCount;
+  return ERR_NONE;
+}
 
-#endif // end of the RDMA_EXEC utils 
+static ErrResult TransferRdma(TransferResources &      resources,
+                              Transfer          const& transfer,
+                              int               & transferIdx
+                             )
+{
+  auto && srcDeviceId     = transfer.exeDevice.exeIndex;  
+  auto && qpCount         = transfer.numSubExecs;
+  assert((transferIdx % qpCount) == 0);
+  uint64_t memIndex = transferIdx / qpCount;
+  auto && srcRdmaResource = resources.rdmaResourceMapper[srcDeviceId];
+  size_t chunkSize = resources.messageSizes[memIndex] / qpCount;
+  size_t remaining_size = resources.messageSizes[memIndex] % qpCount;
+  for (auto i = 0; i < qpCount; ++i) {
+    struct ibv_sge sg = {};
+    struct ibv_send_wr wr = {};
+    size_t currentChunkSize = chunkSize + (i == qpCount - 1 ? remaining_size : 0);
+    sg.addr = (uint64_t)resources.sourceMr[memIndex].second + i * chunkSize;
+    sg.length = currentChunkSize;
+    sg.lkey = resources.sourceMr[memIndex].first->lkey;
+    struct ibv_send_wr *bad_wr;
+    wr.wr_id = transferIdx + i;
+    assert(wr.wr_id < resources.receiveStatuses.size());
+    wr.sg_list = &sg;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_WRITE;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.wr.rdma.remote_addr = (uint64_t)resources.destinationMr[memIndex].second + i * chunkSize;
+    wr.wr.rdma.rkey = resources.destinationMr[memIndex].first->rkey;
+    IBV_CALL(ibv_post_send, resources.senderQp[i], &wr, &bad_wr);
+  }
+  for(auto i = 0; i < qpCount; ++i) {
+    ERR_CHECK(PollIbvCQ(srcRdmaResource->completionQueue, transferIdx + i, resources.receiveStatuses));
+  }
+  return ERR_NONE;
+}
+
+#endif // end of the RDMA_EXEC code 
 
 // Executor-related functions
 //========================================================================================
