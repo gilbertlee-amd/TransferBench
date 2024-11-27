@@ -3773,6 +3773,10 @@ static ErrResult TeardownRdma(TransferResources & resources)
         ERR_CHECK(ParseExeType(dstExeStr, exeDevice, transfer.exeSubIndex));
         transfer.exeDstIndex = exeDevice.exeIndex;
       }
+      if(transfer.exeDevice.exeType == EXE_IBV_NEAREST) {
+        transfer.exeDevice.exeIndex = GetClosestRdmaNicId(transfer.exeDevice.exeIndex);
+        transfer.exeDstIndex        = GetClosestRdmaNicId(transfer.exeDstIndex);
+      }
       transfers.push_back(transfer);
     }
     return ERR_NONE;

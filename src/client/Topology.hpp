@@ -42,17 +42,19 @@ void DisplayTopology(bool outputToCsv)
 {
   int numCpus = TransferBench::GetNumExecutors(EXE_CPU);
   int numGpus = TransferBench::GetNumExecutors(EXE_GPU_GFX);
-
+  int numNics = TransferBench::GetNumExecutors(EXE_IBV);
   char sep = (outputToCsv ? ',' : '|');
 
   if (outputToCsv) {
     printf("NumCpus,%d\n", numCpus);
     printf("NumGpus,%d\n", numGpus);
+    printf("NumNics,%d\n", numNics);
   } else {
     printf("\nDetected Topology:\n");
     printf("==================\n");
     printf("  %d configured CPU NUMA node(s) [%d total]\n", numCpus, numa_max_node() + 1);
     printf("  %d GPU device(s)\n", numGpus);
+    printf("  %d Supported NIC device(s)\n", numNics);
   }
 
   // Print out detected CPU topology
@@ -90,6 +92,9 @@ void DisplayTopology(bool outputToCsv)
     printf("\n");
   }
   printf("\n");
+
+  // Print out detected NIC topology
+  TransferBench::PrintNicToGPUTopo(outputToCsv);
 
   // Print out detected GPU topology
 
