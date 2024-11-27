@@ -370,6 +370,14 @@ namespace TransferBench
    */
   int GetClosestCpuNumaToGpu(int gpuIndex);
 
+ /**
+   * Returns the index of the NIC closest to the given GPU
+   *
+   * @param[in] gpuIndex Index of the GPU to query
+   * @returns IB verbs NIC index closest to GPU gpuIndex, or -1 if unable to detect
+   */
+  int GetClosestNicToGpu(int gpuIndex);
+  
   /**
    * Helper function to parse a line containing Transfers into a vector of Transfers
    *
@@ -3907,10 +3915,17 @@ static ErrResult TeardownRdma(TransferResources & resources)
     return -1;
 #endif
   }
-
+  int GetClosestNicToGpu(int gpuIndex)
+  {
+#ifdef RDMA_EXEC
+    return GetClosestRdmaNicId(gpuIndex);
+#else
+    return -1;
+#endif
+  }
   void PrintNicToGPUTopo(bool printAsCsv)
   {
-#ifdef RDMA_EXEC    
+#ifdef RDMA_EXEC
     InitDeviceMappings();
     if (printAsCsv)
     {
