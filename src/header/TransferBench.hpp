@@ -487,8 +487,6 @@ namespace TransferBench
     if (error != 0) {                                                \
       return {ERR_FATAL, "Encountered IbVerbs error (%d) at line (%d) " \
               "and function (%s)", error, __LINE__, #__func__};      \
-    } else {                                                         \
-      return ERR_NONE;                                               \
     }                                                                \
   } while (0)
 
@@ -499,8 +497,6 @@ namespace TransferBench
     if (__ptr__ == nullptr) {                                           \
       return {ERR_FATAL, "Encountered IbVerbs nullptr error at line (%d) " \
               "and function (%s)", __LINE__, #__func__};                \
-    } else {                                                            \
-      return ERR_NONE;                                                  \
     }                                                                   \
   } while (0)
 
@@ -1069,7 +1065,7 @@ namespace {
         }
         break;
       case EXE_IBV: case EXE_IBV_NEAREST:
-        errors.push_back({ERR_FATAL, "Transfer %d: IBV executor currently not supported", i});
+        // errors.push_back({ERR_FATAL, "Transfer %d: IBV executor currently not supported", i});
         break;
       }
 
@@ -1224,6 +1220,8 @@ namespace {
     ibv_qp **receiverQp = nullptr;               ///< Queue pair for receiving RDMA requests    
     int port;                                    ///< Port ID
     uint8_t qpCount;                             ///< Number of QPs to be used for transferring data
+    int srcNic;                                  ///< Source NIC
+    int dstNic;                                  ///< Destination NIC
 #endif
     // Counters
     double                     totalDurationMsec; ///< Total duration for all iterations for this Transfer
@@ -1422,7 +1420,17 @@ namespace {
 
     return ERR_NONE;
   }
-
+#ifdef RDMA_EXEC
+static ErrResult InitRdmaTransferResources(Transfer          const& transfer,
+                                           TransferResources &      resources,
+                                           RdmaOptions       const& rdmaOptions);
+static ErrResult RegisterRdmaMemoryTransfer(Transfer          const& transfer,
+                                            TransferResources &      resources,
+                                            int               & transferId);
+static ErrResult TransferRdma(TransferResources & resources,
+                              int               const& transferIdx);
+static ErrResult TeardownRdma(TransferResources & resources);
+#endif
   // Prepare each executor
   // Allocates memory for src/dst, prepares subexecutors, executor-specific data structures
   static ErrResult PrepareExecutor(ConfigOptions    const& cfg,
@@ -1558,7 +1566,26 @@ namespace {
                           hipMemcpyHostToDevice));
       ERR_CHECK(hipDeviceSynchronize());
     }
-
+    if (IsRdmaExeType(exeDevice.exeType)) {
+#ifdef RDMA_EXEC
+    for (auto& resources : exeInfo.resources) {
+      Transfer const& t = transfers[resources.transferIdx];
+      ERR_CHECK(InitRdmaTransferResources(t,
+                                          resources,
+                                          cfg.rdma
+                                          ));
+      // Workaround until RDMA resource sharing
+      // (i.e., multi-threading) is required
+      int rdmaTransferId;
+      ERR_CHECK(RegisterRdmaMemoryTransfer(t,
+                                           resources,
+                                           rdmaTransferId));
+      assert(rdmaTransferId == 0);
+    }
+#else
+      return {ERR_FATAL, "RDMA executor is not supported"};
+#endif
+    }
     return ERR_NONE;
   }
 
@@ -1589,6 +1616,11 @@ namespace {
 #if !defined(__NVCC__)
       if (exeDevice.exeType == EXE_GPU_DMA && (t.exeSubIndex != -1 || cfg.dma.useHsaCopy)) {
         ERR_CHECK(hsa_signal_destroy(resources.signal));
+      }
+#endif
+#ifdef RDMA_EXEC
+      if(IsRdmaExeType(exeDevice.exeType)) {
+        ERR_CHECK(TeardownRdma(resources));
       }
 #endif
     }
@@ -1713,6 +1745,60 @@ namespace {
     return ERR_NONE;
   }
 
+#ifdef RDMA_EXEC
+  // Execution of a single Rdma Transfer
+  static void ExecuteRdmaTransfer(int           const  iteration,
+                                  ConfigOptions const& cfg,
+                                  int           const  exeIndex,
+                                  TransferResources&   resources)
+  {
+    auto cpuStart = std::chrono::high_resolution_clock::now();
+    int subIteration = 0;
+    do {
+      ErrResult err = TransferRdma(resources, 0);
+      if(err.errType == ERR_FATAL) {
+        printf("Fatal error during RDMA transfer. Error: %s\n",err.errMsg.c_str());
+        return;
+      } else if (err.errType != ERR_NONE) {
+        printf("Non-fatal error during RDMA transfer. Error: %s\n",err.errMsg.c_str());
+      }
+    } while (++subIteration != cfg.general.numSubIterations);
+
+    auto cpuDelta = std::chrono::high_resolution_clock::now() - cpuStart;
+    double deltaMsec = std::chrono::duration_cast<std::chrono::duration<double>>(cpuDelta).count() * 1000.0;
+
+    if (iteration >= 0) {
+      resources.totalDurationMsec += deltaMsec;
+      if (cfg.general.recordPerIteration)
+        resources.perIterMsec.push_back(deltaMsec);
+    }
+  }
+  // Execution of a single CPU executor
+  static ErrResult RunRdmaExecutor(int           const  iteration,
+                                   ConfigOptions const& cfg,
+                                   int           const  exeIndex,
+                                   ExeInfo&             exeInfo)
+  {
+    auto cpuStart = std::chrono::high_resolution_clock::now();
+
+    vector<std::thread> asyncTransfers;
+    for (auto& resource : exeInfo.resources) {      
+      asyncTransfers.emplace_back(std::thread(ExecuteRdmaTransfer,
+                                              iteration,
+                                              std::cref(cfg),
+                                              exeIndex,
+                                              std::ref(resource)));
+    }
+    for (auto& asyncTransfer : asyncTransfers)
+      asyncTransfer.join();
+
+    auto cpuDelta = std::chrono::high_resolution_clock::now() - cpuStart;
+    double deltaMsec = std::chrono::duration_cast<std::chrono::duration<double>>(cpuDelta).count() * 1000.0;
+    if (iteration >= 0)
+      exeInfo.totalDurationMsec += deltaMsec;
+    return ERR_NONE;
+  }
+#endif
 // GFX Executor-related functions
 //========================================================================================
 
@@ -2222,7 +2308,8 @@ static ErrResult SetIbvGid(ibv_context* const&  ctx,
                            ibv_gid&             gid
                           )
 {
-  IBV_CALL(ibv_query_gid, ctx, portNum, gidIndex, &gid);  
+  IBV_CALL(ibv_query_gid, ctx, portNum, gidIndex, &gid);
+  return ERR_NONE;
 }
 
 static ErrResult TransitionQpToRtr(ibv_qp*         qp,
@@ -2554,9 +2641,9 @@ static ErrResult InitRdmaResources(int                   const& deviceID,
 {
   if (resourceMapper.size() <= deviceID) {
     resourceMapper.resize(deviceID + 1);
-    resourceMapper[deviceID] = nullptr;
+    resourceMapper[deviceID] = nullptr; 
   }
-  if (!resourceMapper[deviceID]) {
+  if (resourceMapper[deviceID] == nullptr) {
     resourceMapper[deviceID] = new NicResources();
     auto& rdma = resourceMapper[deviceID];
     IBV_PTR_CALL(rdma->context, ibv_open_device, deviceList[deviceID]);
@@ -2571,8 +2658,8 @@ static ErrResult InitRdmaResources(int                   const& deviceID,
 }
 
 static ErrResult InitRdmaTransferResources(Transfer          const& transfer,
-                                           RdmaOptions       const& rdmaOptions,
-                                           TransferResources &      resources
+                                           TransferResources &      resources,
+                                           RdmaOptions       const& rdmaOptions
                                           )
 {
   InitDeviceList();  
@@ -2584,6 +2671,9 @@ static ErrResult InitRdmaTransferResources(Transfer          const& transfer,
   auto && qpCount         = transfer.numSubExecs;
   auto && srcDeviceId     = transfer.exeDevice.exeIndex;
   auto && dstDeviceId     = transfer.exeDstIndex;
+  resources.srcNic        = srcDeviceId;
+  resources.dstNic        = dstDeviceId;
+  resources.qpCount       = qpCount;
   ERR_CHECK(InitRdmaResources(srcDeviceId, port, resources.rdmaResourceMapper));
   ERR_CHECK(InitRdmaResources(dstDeviceId, port, resources.rdmaResourceMapper));
   auto && srcRdmaResources = resources.rdmaResourceMapper[srcDeviceId];
@@ -2685,8 +2775,8 @@ static ErrResult InitRdmaTransferResources(Transfer          const& transfer,
   return ERR_NONE;
 }
 // using namespace TransferBench;
-static ErrResult RegisterRdmaMemoryTransfer(TransferResources &      resources,
-                                            Transfer          const& transfer,
+static ErrResult RegisterRdmaMemoryTransfer(Transfer          const& transfer,
+                                            TransferResources &      resources,                   
                                             int               & transferId
                                            )
 {
@@ -2719,12 +2809,11 @@ static ErrResult RegisterRdmaMemoryTransfer(TransferResources &      resources,
   return ERR_NONE;
 }
 
-static ErrResult TransferRdma(TransferResources & resources,
-                              int               const& srcDeviceId,
-                              int               const& transferIdx, 
-                              int               const& qpCount
-                             )
-{  
+static ErrResult TransferRdma(TransferResources & resources, 
+                              int               const& transferIdx)
+{
+  int const& qpCount     = resources.qpCount;
+  int const& srcDeviceId = resources.srcNic;
   assert((transferIdx % qpCount) == 0);
   uint64_t memIndex = transferIdx / qpCount;
   auto && srcRdmaResource = resources.rdmaResourceMapper[srcDeviceId];
@@ -2754,16 +2843,15 @@ static ErrResult TransferRdma(TransferResources & resources,
   return ERR_NONE;
 }
 
-static ErrResult TeardownRdma(TransferResources & resources,
-                              int               const& srcDeviceId,
-                              int               const& dstDeviceId,
-                              int               const& qpCount
-                             )
+static ErrResult TeardownRdma(TransferResources & resources)
 {
-  auto&& sourceMr   = resources.sourceMr;
-  auto&& dstMr      = resources.destinationMr;
-  auto&& senderQp   = resources.senderQp;
-  auto&& receiverQp = resources.receiverQp;
+  auto&& sourceMr    = resources.sourceMr;
+  auto&& dstMr       = resources.destinationMr;
+  auto&& senderQp    = resources.senderQp;
+  auto&& receiverQp  = resources.receiverQp;
+  auto&& srcDeviceId = resources.srcNic;
+  auto&& dstDeviceId = resources.dstNic;
+  auto&& qpCount     = resources.qpCount;
   if (sourceMr.size() > 0) 
   {
     for(auto mr : sourceMr) 
@@ -2850,6 +2938,9 @@ static ErrResult TeardownRdma(TransferResources & resources,
     case EXE_CPU:     return RunCpuExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
     case EXE_GPU_GFX: return RunGpuExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
     case EXE_GPU_DMA: return RunDmaExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
+#ifdef RDMA_EXEC
+    case EXE_IBV: case EXE_IBV_NEAREST: return RunRdmaExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
+#endif
     default:          return {ERR_FATAL, "Unsupported executor (%d)", exeDevice.exeType};
     }
   }
@@ -3132,7 +3223,7 @@ static ErrResult TeardownRdma(TransferResources & resources,
   {
     // Replace any round brackets or '->' with spaces,
     for (int i = 1; line[i]; i++)
-      if (line[i] == '(' || line[i] == ')' || line[i] == '-' || line[i] == '>' ) line[i] = ' ';
+      if (line[i] == '(' || line[i] == ')' || line[i] == '-'  || line[i] == ':' || line[i] == '>' ) line[i] = ' ';
 
     transfers.clear();
 
@@ -3148,7 +3239,7 @@ static ErrResult TeardownRdma(TransferResources & resources,
     numTransfers = abs(numTransfers);
 
     int numSubExecs;
-    std::string srcStr, exeStr, dstStr, numBytesToken;
+    std::string srcStr, exeStr, /*for RDMA*/ dstExeStr, dstStr, numBytesToken;
 
     if (!advancedMode) {
       iss >> numSubExecs;
@@ -3162,14 +3253,26 @@ static ErrResult TeardownRdma(TransferResources & resources,
       Transfer transfer;
 
       if (!advancedMode) {
-        iss >> srcStr >> exeStr >> dstStr;
+        iss >> srcStr >> exeStr;
+        ExeType exeType;
+        ERR_CHECK(CharToExeType(exeStr[0], exeType));
+        if (IsRdmaExeType(exeType)) {
+          iss >> dstExeStr;
+        }
+        iss >> dstStr;
         transfer.numSubExecs = numSubExecs;
         if (iss.fail()) {
           return {ERR_FATAL,
                   "Parsing error: Unable to read valid Transfer %d (SRC EXE DST) triplet", i+1};
         }
       } else {
-        iss >> srcStr >> exeStr >> dstStr >> transfer.numSubExecs >> numBytesToken;
+        iss >> srcStr >> exeStr;
+        ExeType exeType;
+        ERR_CHECK(CharToExeType(exeStr[0], exeType));
+        if (IsRdmaExeType(exeType)) {
+          iss >> dstExeStr;
+        }
+        iss >> dstStr >> transfer.numSubExecs >> numBytesToken;
         if (iss.fail()) {
           return {ERR_FATAL,
                   "Parsing error: Unable to read valid Transfer %d (SRC EXE DST $CU #Bytes) tuple", i+1};
@@ -3181,16 +3284,20 @@ static ErrResult TeardownRdma(TransferResources & resources,
 
         char units = numBytesToken.back();
         switch (toupper(units)) {
-        case 'G': transfer.numBytes *= 1024;
-        case 'M': transfer.numBytes *= 1024;
-        case 'K': transfer.numBytes *= 1024;
+          case 'G': transfer.numBytes *= 1024;
+          case 'M': transfer.numBytes *= 1024;
+          case 'K': transfer.numBytes *= 1024;
         }
       }
 
       ERR_CHECK(ParseMemType(srcStr, transfer.srcs));
       ERR_CHECK(ParseMemType(dstStr, transfer.dsts));
       ERR_CHECK(ParseExeType(exeStr, transfer.exeDevice, transfer.exeSubIndex));
-
+      if(IsRdmaExeType(transfer.exeDevice.exeType)) {
+        ExeDevice exeDevice; 
+        ERR_CHECK(ParseExeType(dstExeStr, exeDevice, transfer.exeSubIndex));
+        transfer.exeDstIndex = exeDevice.exeIndex;
+      }
       transfers.push_back(transfer);
     }
     return ERR_NONE;
