@@ -380,6 +380,17 @@ namespace TransferBench
   ErrResult ParseTransfers(std::string str,
                            std::vector<Transfer>& transfers);
 
+  /**
+   * Prints the topology information between NICs and GPUs.
+   * 
+   * This function outputs the topology details of the connection between
+   * the RDMA NICs and the GPUs.
+   * The output format can be optionally in CSV f
+   * 
+   * @param[in] printAsCsv If true, the output will be in CSV format. If false,
+   *                       the output will be in a table format.
+   */
+  void PrintNicToGPUTopo(bool printAsCsv);
 };
 //==========================================================================================
 // End of TransferBench API
@@ -2372,7 +2383,9 @@ static const PCIe_tree* getLcaBetweenNodes(const PCIe_tree* root, std::string no
   return leftLCA ? leftLCA : rightLCA;
 }
 
-static int getLcaDepth(const std::string targetBusID, const PCIe_tree* node, int depth = 0)
+static int GetLcaDepth(std::string      const& targetBusID,
+                       const PCIe_tree* const& node,
+                       int                     depth = 0)
 {
   if (!node)
   {
@@ -2382,9 +2395,9 @@ static int getLcaDepth(const std::string targetBusID, const PCIe_tree* node, int
   {
     return depth;
   }
-  for (const auto& child : node->children)
+  for (auto&& child : node->children)
   {
-    int distance = getLcaDepth(targetBusID, &child, depth + 1);
+    int distance = GetLcaDepth(targetBusID, &child, depth + 1);
     if (distance != -1)
     {
       return distance;
@@ -2394,7 +2407,7 @@ static int getLcaDepth(const std::string targetBusID, const PCIe_tree* node, int
 }
 
 // Function to extract the bus number from a PCIe address (domain:bus:device.function)
-static int ExtractBusNumber(const std::string& pcieAddress)
+static int ExtractBusNumber(std::string const& pcieAddress)
 {
   int domain, bus, device, function;
   char delimiter;
@@ -2412,7 +2425,8 @@ static int ExtractBusNumber(const std::string& pcieAddress)
 }
 
 // Function to compute the distance between two bus IDs 
-static int GetBusIdDistance(const std::string& pcieAddress1, const std::string& pcieAddress2)
+static int GetBusIdDistance(std::string const& pcieAddress1, 
+                            std::string const& pcieAddress2)
 {
   int bus1 = ExtractBusNumber(pcieAddress1);
   int bus2 = ExtractBusNumber(pcieAddress2);
@@ -2426,7 +2440,9 @@ static int GetBusIdDistance(const std::string& pcieAddress1, const std::string& 
   return std::abs(bus1 - bus2);
 }
 
-static int GetNearestPcieDeviceInTree(const PCIe_tree& root, const std::string busID, const std::vector<std::string>& targetBusIds)
+static int GetNearestPcieDeviceInTree(PCIe_tree                const& root, 
+                                      std::string              const& busID, 
+                                      std::vector<std::string> const& targetBusIds)
 {
   int max_depth = -1;
   int index_of_closest = -1;
@@ -2437,7 +2453,7 @@ static int GetNearestPcieDeviceInTree(const PCIe_tree& root, const std::string b
     const PCIe_tree* lca = getLcaBetweenNodes(&root, busID, targetBusID);
     if (lca)
     {
-      int depth = getLcaDepth(lca->address, &pcie_root);
+      int depth = GetLcaDepth(lca->address, &pcie_root);
       if (depth > max_depth)
       {        
         max_depth = depth;
@@ -2683,13 +2699,16 @@ static void InitDeviceMappings()
   }  
 }
 
-int GetClosestIbDevice(int hipDeviceId)
+static int GetClosestIbDevice(int hipDeviceId)
 {
   InitDeviceMappings();
   assert(hipDeviceId < GpuToNicMapper.size());
   return GpuToNicMapper[hipDeviceId];
 }
-void PrintPCIeTree(const PCIe_tree& node, const std::string& prefix = "", bool isLast = true)
+
+static void PrintPCIeTree(PCIe_tree   const& node, 
+                          std::string const& prefix = "", 
+                          bool               isLast = true)
 {
   if(!node.address.empty())
   {
@@ -2705,62 +2724,6 @@ void PrintPCIeTree(const PCIe_tree& node, const std::string& prefix = "", bool i
   {
     PrintPCIeTree(*it, prefix + (isLast ? "    " : "│   "), std::next(it) == children.end());
   }
-}
-
-void PrintNicToGPUTopo(bool printAsCsv)
-{
-  InitDeviceMappings();
-  if (printAsCsv)
-  {
-    std::cout << "Device Index,Device Name,Port Active,Closest GPU(s)" << std::endl;
-  }
-  else
-  {
-    std::cout << "Device Index | Device Name | Port Active | Closest GPU(s)| PCIe Bus ID" << std::endl;
-    std::cout << "-------------+-------------+-------------+---------------+------------" << std::endl;
-  }
-
-  for (int i = 0; i < IbDeviceBusIds.size(); ++i)
-  {
-    std::string nicDevice = DeviceNames[i];
-    bool portActive = IbDeviceBusIds[i] != "";
-    std::string closestGpus;
-    for (auto it = NicToGpuMapper[i].begin(); it != NicToGpuMapper[i].end(); ++it)
-    {
-      closestGpus += std::to_string(*it);
-      if (std::next(it) != NicToGpuMapper[i].end())
-      {
-        closestGpus += ",";
-      }
-    }
-    if (printAsCsv)
-    {
-      std::cout << i << ","
-          << nicDevice << "," 
-          << (portActive ? "Yes" : "No") << ","
-          << closestGpus <<  ","
-          << IbDeviceBusIds[i] <<std::endl;
-    }
-    else
-    {
-      std::cout << std::left << std::setw(12) << i << " | "
-          << std::left << std::setw(11) << nicDevice << " | "
-          << std::left << std::setw(11) << (portActive ? "Yes" : "No") << " | "
-          << std::left << std::setw(13) << closestGpus << " | "
-          << std::left << std::setw(11) << IbDeviceBusIds[i] 
-          << std::endl;
-    }
-  }
-  std::cout << std::endl;
-  if (std::getenv("SHOW_TOPO_TREE"))
-  {
-    std::cout << "--------------------------" << std::endl;
-    std::cout << "PCIe Tree (NICs and GPUs):" << std::endl;
-    std::cout << "--------------------------" << std::endl;
-    PrintPCIeTree(pcie_root);
-    std::cout << std::endl;
-  }
-
 }
 
 static ErrResult CreateQP(struct ibv_pd *pd,
@@ -3827,6 +3790,14 @@ static ErrResult TeardownRdma(TransferResources & resources)
       if (status != hipSuccess) numDetectedGpus = 0;
       return numDetectedGpus;
     }
+#ifdef RDMA_EXEC
+    case EXE_IBV: case EXE_IBV_NEAREST:
+    {
+      int numDetectedNics = 0;      
+      if (GetNicCount(numDetectedNics).errType != ERR_NONE) numDetectedNics = 0;
+      return numDetectedNics;
+    }
+#endif
     default:
       return 0;
     }
@@ -3932,6 +3903,65 @@ static ErrResult TeardownRdma(TransferResources & resources)
     return -1;
 #endif
   }
+
+  void PrintNicToGPUTopo(bool printAsCsv)
+  {
+#ifdef RDMA_EXEC    
+    InitDeviceMappings();
+    if (printAsCsv)
+    {
+      std::cout << "Device Index,Device Name,Port Active,Closest GPU(s)" << std::endl;
+    }
+    else
+    {
+      std::cout << "Device Index | Device Name | Port Active | Closest GPU(s)| PCIe Bus ID" << std::endl;
+      std::cout << "-------------+-------------+-------------+---------------+------------" << std::endl;
+    }
+
+    for (int i = 0; i < IbDeviceBusIds.size(); ++i)
+    {
+      std::string nicDevice = DeviceNames[i];
+      bool portActive = IbDeviceBusIds[i] != "";
+      std::string closestGpus;
+      for (auto it = NicToGpuMapper[i].begin(); it != NicToGpuMapper[i].end(); ++it)
+      {
+        closestGpus += std::to_string(*it);
+        if (std::next(it) != NicToGpuMapper[i].end())
+        {
+          closestGpus += ",";
+        }
+      }
+      if (printAsCsv)
+      {
+        std::cout << i << ","
+            << nicDevice << "," 
+            << (portActive ? "Yes" : "No") << ","
+            << closestGpus <<  ","
+            << IbDeviceBusIds[i] <<std::endl;
+      }
+      else
+      {
+        std::cout << std::left << std::setw(12) << i << " | "
+            << std::left << std::setw(11) << nicDevice << " | "
+            << std::left << std::setw(11) << (portActive ? "Yes" : "No") << " | "
+            << std::left << std::setw(13) << closestGpus << " | "
+            << std::left << std::setw(11) << IbDeviceBusIds[i] 
+            << std::endl;
+      }
+    }
+    std::cout << std::endl;
+    if (std::getenv("SHOW_TOPO_TREE"))
+    {
+      std::cout << "--------------------------" << std::endl;
+      std::cout << "PCIe Tree (NICs and GPUs):" << std::endl;
+      std::cout << "--------------------------" << std::endl;
+      PrintPCIeTree(pcie_root);
+      std::cout << std::endl;
+    }
+#endif    
+  }
+
+
 
 // Undefine CUDA compatibility macros
 #if defined(__NVCC__)
