@@ -374,7 +374,7 @@ namespace TransferBench
    * Returns the index of the NIC closest to the given GPU
    *
    * @param[in] gpuIndex Index of the GPU to query
-   * @returns IB verbs NIC index closest to GPU gpuIndex, or -1 if unable to detect
+   * @returns IB Verbs capable NIC index closest to GPU gpuIndex, or -1 if unable to detect
    */
   int GetClosestNicToGpu(int gpuIndex);
   
@@ -393,7 +393,7 @@ namespace TransferBench
    * 
    * This function outputs the topology details of the connection between
    * the RDMA NICs and the GPUs.
-   * The output format can be optionally in CSV f
+   * The output format can be optionally in CSV format
    * 
    * @param[in] printAsCsv If true, the output will be in CSV format. If false,
    *                       the output will be in a table format.
