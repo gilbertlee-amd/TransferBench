@@ -25,10 +25,10 @@ THE SOFTWARE.
 // TransferBench client version
 #define CLIENT_VERSION "1.54.00"
 
-#include "TransferBench.hpp"
 #include "EnvVars.hpp"
+#include "TransferBench.hpp"
 
-size_t const DEFAULT_BYTES_PER_TRANSFER = (1<<26);
+size_t const DEFAULT_BYTES_PER_TRANSFER = (1 << 26);
 
 char const ExeTypeName[4][4] = {"CPU", "GPU", "DMA", "IBV"};
 
@@ -39,8 +39,9 @@ void DisplayTopology(bool outputToCsv);
 void DisplayUsage(char const* cmdName);
 
 // Print TransferBench test results
-void PrintResults(EnvVars const& ev, int const testNum,
-                  std::vector<Transfer> const& transfers,
+void PrintResults(EnvVars const&                    ev,
+                  int const                         testNum,
+                  std::vector<Transfer> const&      transfers,
                   TransferBench::TestResults const& results);
 
 // Helper function that converts MemDevices to a string
