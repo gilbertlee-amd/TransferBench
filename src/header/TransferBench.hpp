@@ -44,6 +44,11 @@ THE SOFTWARE.
 #include <arpa/inet.h>
 #include <assert.h>
 #include <fcntl.h>
+#include <iostream>
+#include <fstream>
+#include <filesystem>
+#include <unistd.h>
+
 #endif
 
 #if defined(__NVCC__)
@@ -2247,9 +2252,516 @@ const unsigned int rdmaFlags = IBV_ACCESS_LOCAL_WRITE    |
                                IBV_ACCESS_REMOTE_WRITE   |
                                IBV_ACCESS_REMOTE_ATOMIC;
 #define IB_PSN  0
+#define INIT_ONCE(ret)  \
+  do {                  \
+  if(Initialized)       \
+  {                     \
+    return ret;         \
+  }                     \
+  Initialized = true;   \
+  } while(0);
+
 const  uint64_t WR_ID = 1789;
 static ibv_device** deviceList = nullptr;
 static int RdmaNicCount        = -1;
+static std::vector<std::string> IbDeviceBusIds;
+static std::vector<std::set<int>> NicToGpuMapper;
+static std::vector<int> GpuToNicMapper;
+static std::vector<std::string> DeviceNames;
+static int GpuCount;
+static bool Initialized = false;
+static bool MultiportFlag = false;
+
+class PCIe_tree 
+{
+public:
+  std::set<PCIe_tree> children;
+  std::string address;
+  std::string description;
+
+  // Constructor
+  PCIe_tree(const std::string& addr) : address(addr) {}
+  
+    // Constructor
+  PCIe_tree(const std::string& addr, const std::string& desc)
+           :address(addr), description(desc) {}
+
+  // Default constructor
+  PCIe_tree() : address(""), description("") {}
+
+  // Comparison operator for std::set
+  bool operator<(const PCIe_tree& other) const {
+    return address < other.address;
+  }
+
+  // Function to find a node by address
+  const PCIe_tree* find(const std::string& addr) const {
+    if (address == addr) {
+      return this;
+    }
+    for (const auto& child : children) {
+      const PCIe_tree* result = child.find(addr);
+      if (result) {
+        return result;
+      }
+    }
+    return nullptr;
+  }
+};
+
+static PCIe_tree pcie_root;
+
+static void InsertPCIePathToTree(PCIe_tree* root, const std::string& pcieAddress, const std::string& description)
+{
+  std::filesystem::path devicePath = "/sys/bus/pci/devices/" + pcieAddress;
+  if (!std::filesystem::exists(devicePath))
+  {
+    printf("[ERROR] Device path %s does not exist\n", devicePath.c_str());
+    return;
+  }
+  std::string canonicalPath = std::filesystem::canonical(devicePath).string();
+  std::istringstream iss(canonicalPath);
+  std::string token;
+  PCIe_tree* currentNode = root;
+
+  while (std::getline(iss, token, '/'))
+  {
+    std::string address = token;
+    auto it = currentNode->children.find(PCIe_tree(address));
+    if (it == currentNode->children.end())
+    {
+      currentNode->children.insert(PCIe_tree(address));
+      it = currentNode->children.find(PCIe_tree(address));
+    }
+    currentNode = const_cast<PCIe_tree*>(&(*it));
+  }
+  currentNode->description = description;
+}
+
+static const PCIe_tree* getLcaBetweenNodes(const PCIe_tree* root, std::string node1, std::string node2)
+{
+  if (!root || root->address == node1 || root->address == node2)
+  {
+    return root;
+  }
+
+  const PCIe_tree* leftLCA = nullptr;
+  const PCIe_tree* rightLCA = nullptr;
+
+  for (const auto& child : root->children)
+  {
+    const PCIe_tree* lca = getLcaBetweenNodes(&child, node1, node2);
+    if (lca)
+    {
+      if (leftLCA)
+      {
+        rightLCA = lca;
+        break;
+      } 
+      else
+      {
+        leftLCA = lca;
+      }
+    }
+  }
+
+  if (leftLCA && rightLCA) {
+    return root;
+  }
+
+  return leftLCA ? leftLCA : rightLCA;
+}
+
+static int getLcaDepth(const std::string targetBusID, const PCIe_tree* node, int depth = 0)
+{
+  if (!node)
+  {
+    return -1;
+  }
+  if (targetBusID == node->address)
+  {
+    return depth;
+  }
+  for (const auto& child : node->children)
+  {
+    int distance = getLcaDepth(targetBusID, &child, depth + 1);
+    if (distance != -1)
+    {
+      return distance;
+    }
+  }
+  return -1;
+}
+
+// Function to extract the bus number from a PCIe address (domain:bus:device.function)
+static int ExtractBusNumber(const std::string& pcieAddress)
+{
+  int domain, bus, device, function;
+  char delimiter;
+
+  std::istringstream iss(pcieAddress);
+  iss >> std::hex >> domain >> delimiter >> bus >> delimiter >> device >> delimiter >> function;
+
+  if (iss.fail())
+  {
+    std::cerr << "Invalid PCIe address format: " << pcieAddress << std::endl;
+    return -1; // Invalid bus number
+  }
+
+  return bus;
+}
+
+// Function to compute the distance between two bus IDs 
+static int GetBusIdDistance(const std::string& pcieAddress1, const std::string& pcieAddress2)
+{
+  int bus1 = ExtractBusNumber(pcieAddress1);
+  int bus2 = ExtractBusNumber(pcieAddress2);
+
+  if (bus1 == -1 || bus2 == -1)
+  {
+    return -1; // Error case, invalid bus number
+  }
+
+  // Distance between two PCIe devices based on their bus numbers
+  return std::abs(bus1 - bus2);
+}
+
+static int GetNearestPcieDeviceInTree(const PCIe_tree& root, const std::string busID, const std::vector<std::string>& targetBusIds)
+{
+  int max_depth = -1;
+  int index_of_closest = -1;
+  std::vector <int> matches;
+  for (const auto& targetBusID : targetBusIds)
+  {
+    if (targetBusID.empty()) continue;    
+    const PCIe_tree* lca = getLcaBetweenNodes(&root, busID, targetBusID);
+    if (lca)
+    {
+      int depth = getLcaDepth(lca->address, &pcie_root);
+      if (depth > max_depth)
+      {        
+        max_depth = depth;
+        index_of_closest = &targetBusID - &targetBusIds[0];
+        matches.clear(); // found a new max depth
+        matches.push_back(index_of_closest);
+      }
+      else if(depth == max_depth && depth >= 0)
+      {
+        matches.push_back(&targetBusID - &targetBusIds[0]);
+      }
+    }
+  }
+  // 1. When more than one LCA match is found, opt for the one with the smallest
+  // bus id difference 
+  // 2. Also cover when two NICs have the same busIds which indicates a dualport case 
+  // (only two ports supported)
+  if(matches.size() > 1)
+  {
+    int minDistance = std::numeric_limits<int>::max();
+    for (int i = 0; i < matches.size(); ++i)
+    {
+      for(int j = i + 1; j < matches.size(); ++j)
+      {
+        // Multiport NIC
+        if(ExtractBusNumber(targetBusIds[matches[i]]) == ExtractBusNumber(targetBusIds[matches[j]]))
+        {
+          index_of_closest = !MultiportFlag? matches[i] : matches[j];
+          // Workaround to distribute ports over GPUs
+          MultiportFlag = !MultiportFlag;
+          return index_of_closest;
+        }
+      }
+      int distance = GetBusIdDistance(busID, targetBusIds[matches[i]]);
+      if (distance < minDistance)
+      {
+        minDistance = distance;
+        index_of_closest = matches[i];
+      }      
+    }
+  }
+  return index_of_closest;
+}
+
+static void BuildPCIeTree()
+{
+  struct ibv_device **dev_list;
+  dev_list = ibv_get_device_list(&RdmaNicCount);
+  if (!dev_list)
+  {
+    std::cerr << "Failed to get IB devices list." << std::endl;
+    return;
+  }
+  IbDeviceBusIds.resize(RdmaNicCount, "");
+  NicToGpuMapper.resize(RdmaNicCount);
+  DeviceNames.resize(RdmaNicCount);
+
+  for (int i = 0; i < RdmaNicCount; ++i)
+  {
+    struct ibv_device *device = dev_list[i];
+    DeviceNames[i] = device->name;
+    struct ibv_context *context = ibv_open_device(device);
+    if (!context)
+    {
+      std::cerr << "Failed to open device " << device->name << std::endl;
+      continue;
+    }
+
+    struct ibv_device_attr device_attr;
+    if (ibv_query_device(context, &device_attr))
+    {
+      std::cerr << "Failed to query device attributes for " << device->name << std::endl;
+      ibv_close_device(context);
+      continue;
+    }
+
+    bool portActive = false;
+    for (int port = 1; port <= device_attr.phys_port_cnt; ++port)
+    {
+      struct ibv_port_attr port_attr;
+      if (ibv_query_port(context, port, &port_attr))
+      {
+        std::cerr << "Failed to query port " << port << " attributes for " << device->name << std::endl;
+        continue;
+      }
+      if (port_attr.state == IBV_PORT_ACTIVE)
+      {
+        portActive = true;
+        break;
+      }
+    }
+
+    ibv_close_device(context);
+
+    if (!portActive)
+    {        
+      continue;
+    }
+
+    std::string device_path(device->dev_path);
+    if (std::filesystem::exists(device_path))
+    {
+      std::string pciPath = std::filesystem::canonical(device_path + "/device").string();
+      std::size_t pos = pciPath.find_last_of('/');
+      if (pos != std::string::npos) {
+        std::string nicBusId = pciPath.substr(pos + 1);
+        IbDeviceBusIds[i] = nicBusId;
+        InsertPCIePathToTree(&pcie_root, nicBusId, DeviceNames[i]);
+      }
+    }
+  }
+  ibv_free_device_list(dev_list);
+  hipError_t err;
+  err = (hipGetDeviceCount(&GpuCount));
+  if (err != hipSuccess) {    
+    std::cerr << "Failed to get GPU device count " << hipGetErrorString(err) << std::endl;
+    return;
+  }
+  GpuToNicMapper.resize(GpuCount, -1);
+  for (int i = 0; i < GpuCount; ++i)
+  {
+    char hipPciBusId[64];
+    hipError_t err = hipDeviceGetPCIBusId(hipPciBusId, sizeof(hipPciBusId), i);
+    if (err != hipSuccess) 
+    {
+      std::cerr << "Failed to get PCI Bus ID for HIP device " << i << ": " << hipGetErrorString(err) << std::endl;
+      return;   
+    }
+    InsertPCIePathToTree(&pcie_root, hipPciBusId, "GPU " + std::to_string(i));
+  }  
+}
+
+static int GetClosestRdmaNicId(int hipDeviceId)
+{   
+  char hipPciBusId[64];
+  hipError_t err = hipDeviceGetPCIBusId(hipPciBusId, sizeof(hipPciBusId), hipDeviceId);
+  if (err != hipSuccess) 
+  {
+    std::cerr << "Failed to get PCI Bus ID for HIP device " << hipDeviceId << ": " << hipGetErrorString(err) << std::endl;
+    return -1;
+  }
+  int closestRdmaNicId = GetNearestPcieDeviceInTree(pcie_root, hipPciBusId, IbDeviceBusIds);
+  // The following will only use distance between bus IDs 
+  // to determine the closest NIC to GPU if the PCIe tree approach fails
+  if(closestRdmaNicId < 0)
+  {
+    printf("[Warn] falling back to PCIe bus ID distance to determine proximity\n");
+    int minDistance = std::numeric_limits<int>::max();
+    for (int i = 0; i < IbDeviceBusIds.size(); ++i)
+    { 
+      auto address = IbDeviceBusIds[i];
+      if (address != "") {
+        int distance = GetBusIdDistance(hipPciBusId, address);
+        if (distance < minDistance && distance >= 0)
+        {
+          minDistance = distance;
+          closestRdmaNicId = i;
+        }
+      }
+    }  
+  }
+  return closestRdmaNicId;    
+}
+
+static int GetClosestGpuDeviceId(int IbvDeviceId)
+{
+  BuildPCIeTree();
+  assert(IbvDeviceId < IbDeviceBusIds.size());
+  auto address = IbDeviceBusIds[IbvDeviceId];
+  if (address.empty()) return -1;      
+  int closestDevice = -1;
+  int minDistance = std::numeric_limits<int>::max();
+  for (int i = 0; i < GpuCount; ++i)
+  {
+    char hipPciBusId[64];
+    hipError_t err = hipDeviceGetPCIBusId(hipPciBusId, sizeof(hipPciBusId), i);
+    if (err != hipSuccess) 
+    {
+      std::cerr << "Failed to get PCI Bus ID for HIP device " << i << ": " << hipGetErrorString(err) << std::endl;
+      return -1;
+    }
+    int distance = GetBusIdDistance(hipPciBusId, address);
+    if (distance < minDistance && distance >= 0)
+    {
+      minDistance = distance;
+      closestDevice = i;
+    }
+  }
+  return closestDevice;
+}
+
+static void InitDeviceMappings()
+{
+  INIT_ONCE();  
+  BuildPCIeTree();
+  const char* closestNicEnv = std::getenv("CLOSEST_NIC");
+  if (closestNicEnv)
+  {
+    std::istringstream iss(closestNicEnv);
+    std::string token;
+    int i = 0; 
+    while (std::getline(iss, token, ','))
+    {
+      try
+      {
+        int nicId = std::stoi(token);
+        if (nicId >= 0 && nicId < RdmaNicCount)
+        {
+          GpuToNicMapper[i] = nicId;
+          assert(nicId < NicToGpuMapper.size());
+          NicToGpuMapper[nicId].insert(i);
+          i++;
+        }
+        else
+        {
+          std::cerr << "[Error] Invalid NIC ID in CLOSEST_NIC environment variable: " << nicId << std::endl;
+          exit(1);
+        }        
+      }
+      catch (const std::invalid_argument& e)
+      {
+        std::cerr << "[Error] Invalid NIC ID in CLOSEST_NIC environment variable: " << token << std::endl;
+        exit(1);
+      }
+    }
+    if(i < GpuCount)
+    {
+      std::cerr << "[Error] Number of entries in CLOSEST_NIC environment variable is less than the number of detected GPUs: " << GpuCount<< std::endl;
+      exit(1);
+    }
+  }
+  else 
+  {
+    for (int i = 0; i < GpuCount; ++i) {
+      int closestIbDevice = GetClosestRdmaNicId(i);
+      GpuToNicMapper[i] = closestIbDevice;
+      if(closestIbDevice >= 0)
+      {
+        assert(closestIbDevice < NicToGpuMapper.size());
+        NicToGpuMapper[closestIbDevice].insert(i);
+      }
+    }
+  }  
+}
+
+int GetClosestIbDevice(int hipDeviceId)
+{
+  InitDeviceMappings();
+  assert(hipDeviceId < GpuToNicMapper.size());
+  return GpuToNicMapper[hipDeviceId];
+}
+void PrintPCIeTree(const PCIe_tree& node, const std::string& prefix = "", bool isLast = true)
+{
+  if(!node.address.empty())
+  {
+    std::cout << prefix << (isLast ? "└── " : "├── ") << node.address;
+    if(!node.description.empty())
+    {
+      std::cout << "(" << node.description << ")";
+    }
+    std::cout<< std::endl;
+  }
+  const auto& children = node.children;
+  for (auto it = children.begin(); it != children.end(); ++it)
+  {
+    PrintPCIeTree(*it, prefix + (isLast ? "    " : "│   "), std::next(it) == children.end());
+  }
+}
+
+void PrintNicToGPUTopo(bool printAsCsv)
+{
+  InitDeviceMappings();
+  if (printAsCsv)
+  {
+    std::cout << "Device Index,Device Name,Port Active,Closest GPU(s)" << std::endl;
+  }
+  else
+  {
+    std::cout << "Device Index | Device Name | Port Active | Closest GPU(s)| PCIe Bus ID" << std::endl;
+    std::cout << "-------------+-------------+-------------+---------------+------------" << std::endl;
+  }
+
+  for (int i = 0; i < IbDeviceBusIds.size(); ++i)
+  {
+    std::string nicDevice = DeviceNames[i];
+    bool portActive = IbDeviceBusIds[i] != "";
+    std::string closestGpus;
+    for (auto it = NicToGpuMapper[i].begin(); it != NicToGpuMapper[i].end(); ++it)
+    {
+      closestGpus += std::to_string(*it);
+      if (std::next(it) != NicToGpuMapper[i].end())
+      {
+        closestGpus += ",";
+      }
+    }
+    if (printAsCsv)
+    {
+      std::cout << i << ","
+          << nicDevice << "," 
+          << (portActive ? "Yes" : "No") << ","
+          << closestGpus <<  ","
+          << IbDeviceBusIds[i] <<std::endl;
+    }
+    else
+    {
+      std::cout << std::left << std::setw(12) << i << " | "
+          << std::left << std::setw(11) << nicDevice << " | "
+          << std::left << std::setw(11) << (portActive ? "Yes" : "No") << " | "
+          << std::left << std::setw(13) << closestGpus << " | "
+          << std::left << std::setw(11) << IbDeviceBusIds[i] 
+          << std::endl;
+    }
+  }
+  std::cout << std::endl;
+  if (std::getenv("SHOW_TOPO_TREE"))
+  {
+    std::cout << "--------------------------" << std::endl;
+    std::cout << "PCIe Tree (NICs and GPUs):" << std::endl;
+    std::cout << "--------------------------" << std::endl;
+    PrintPCIeTree(pcie_root);
+    std::cout << std::endl;
+  }
+
+}
 
 static ErrResult CreateQP(struct ibv_pd *pd,
                           struct ibv_cq *cq,
