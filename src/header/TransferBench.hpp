@@ -49,7 +49,7 @@ namespace TransferBench
   using std::set;
   using std::vector;
 
-  constexpr char VERSION[] = "1.56";
+  constexpr char VERSION[] = "1.57";
 
   /**
    * Enumeration of supported Executor types
@@ -76,8 +76,9 @@ namespace TransferBench
     ExeType exeType;                            ///< Executor type
     int32_t exeIndex;                           ///< Executor index
 
-    // Default comparison operator
-    auto operator<=>(const ExeDevice&) const = default;
+    bool operator<(ExeDevice const& other) const {
+      return (exeType < other.exeType) || (exeType == other.exeType && exeIndex < other.exeIndex);
+    }
   };
 
   /**
@@ -106,7 +107,10 @@ namespace TransferBench
   {
     MemType memType;                            ///< Memory type
     int32_t memIndex;                           ///< Device index
-    auto operator<=>(const MemDevice&) const = default;
+
+    bool operator<(MemDevice const& other) const {
+      return (memType < other.memType) || (memType == other.memType && memIndex < other.memIndex);
+    }
   };
 
   /**
@@ -168,7 +172,7 @@ namespace TransferBench
     int                 unrollFactor   = 4;     ///< GFX-kernel unroll factor
     int                 useHipEvents   = 1;     ///< Use HIP events for timing GFX Executor
     int                 useMultiStream = 0;     ///< Use multiple streams for GFX
-    int                 useSingleTeam  = 1;     ///< Team all subExecutors across the data array
+    int                 useSingleTeam  = 0;     ///< Team all subExecutors across the data array
     int                 waveOrder      = 0;     ///< GFX-kernel wavefront ordering
   };
 
