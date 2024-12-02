@@ -218,7 +218,6 @@ void PrintResults(EnvVars const& ev, int const testNum,
     ExeResult const& exeResult = exeInfoPair.second;
     ExeType const    exeType   = exeDevice.exeType;
     int32_t const    exeIndex  = exeDevice.exeIndex;
-    int32_t const    dstExeIndex  = exeDevice.exeIndex;
 
     printf(" Executor: %3s %02d %c %7.3f GB/s %c %8.3f ms %c %12lu bytes %c %-7.3f GB/s (sum)\n",
            ExeTypeName[exeType], exeIndex, sep, exeResult.avgBandwidthGbPerSec, sep,
