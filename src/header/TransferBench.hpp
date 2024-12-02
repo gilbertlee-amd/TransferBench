@@ -32,9 +32,6 @@ THE SOFTWARE.
 #include <thread>
 #include <vector>
 
-
-#define RDMA_EXEC
-
 #ifdef RDMA_EXEC
 #include <infiniband/verbs.h>
 #include <stdio.h>
@@ -44,11 +41,8 @@ THE SOFTWARE.
 #include <arpa/inet.h>
 #include <assert.h>
 #include <fcntl.h>
-#include <iostream>
-#include <fstream>
-#include <filesystem>
 #include <unistd.h>
-
+#include <filesystem>
 #endif
 
 #if defined(__NVCC__)
@@ -378,6 +372,14 @@ namespace TransferBench
    */
   int GetClosestNicToGpu(int gpuIndex);
   
+   /**
+   * Returns the indices of the GPUs closest to a NIC using PCIe addressing scheme.
+   * @note The size of the returned vector can be > 1 when GPUs > NICs
+   * @param[in] nicIndex Index of the NIC based on the Ib Verbs device list
+   * @returns A vector of GPU IDs closest to the NIC
+   */
+  std::vector<int> GetClosestGpusToNic(int nicIndex);
+
   /**
    * Helper function to parse a line containing Transfers into a vector of Transfers
    *
@@ -387,18 +389,6 @@ namespace TransferBench
    */
   ErrResult ParseTransfers(std::string str,
                            std::vector<Transfer>& transfers);
-
-  /**
-   * Prints the topology information between NICs and GPUs.
-   * 
-   * This function outputs the topology details of the connection between
-   * the RDMA NICs and the GPUs.
-   * The output format can be optionally in CSV format
-   * 
-   * @param[in] printAsCsv If true, the output will be in CSV format. If false,
-   *                       the output will be in a table format.
-   */
-  void PrintNicToGPUTopo(bool printAsCsv);
 };
 //==========================================================================================
 // End of TransferBench API
@@ -2425,7 +2415,7 @@ static int ExtractBusNumber(std::string const& pcieAddress)
 
   if (iss.fail())
   {
-    std::cerr << "Invalid PCIe address format: " << pcieAddress << std::endl;
+    printf("Invalid PCIe address format: %s\n", pcieAddress.c_str());
     return -1; // Invalid bus number
   }
 
@@ -2512,7 +2502,7 @@ static void BuildPCIeTree()
   dev_list = ibv_get_device_list(&RdmaNicCount);
   if (!dev_list)
   {
-    std::cerr << "Failed to get IB devices list." << std::endl;
+    printf("Failed to get IB devices list.\n");
     return;
   }
   IbDeviceBusIds.resize(RdmaNicCount, "");
@@ -2526,14 +2516,14 @@ static void BuildPCIeTree()
     struct ibv_context *context = ibv_open_device(device);
     if (!context)
     {
-      std::cerr << "Failed to open device " << device->name << std::endl;
+      printf("Failed to open device %s\n", device->name);
       continue;
     }
 
     struct ibv_device_attr device_attr;
     if (ibv_query_device(context, &device_attr))
     {
-      std::cerr << "Failed to query device attributes for " << device->name << std::endl;
+      printf("Failed to query device attributes for %s\n", device->name);
       ibv_close_device(context);
       continue;
     }
@@ -2544,7 +2534,7 @@ static void BuildPCIeTree()
       struct ibv_port_attr port_attr;
       if (ibv_query_port(context, port, &port_attr))
       {
-        std::cerr << "Failed to query port " << port << " attributes for " << device->name << std::endl;
+        printf("Failed to query port %d attributes for %s\n", port, device->name);
         continue;
       }
       if (port_attr.state == IBV_PORT_ACTIVE)
@@ -2577,7 +2567,7 @@ static void BuildPCIeTree()
   hipError_t err;
   err = (hipGetDeviceCount(&GpuCount));
   if (err != hipSuccess) {    
-    std::cerr << "Failed to get GPU device count " << hipGetErrorString(err) << std::endl;
+    printf("Failed to get GPU device count: %s\n", hipGetErrorString(err));
     return;
   }
   GpuToNicMapper.resize(GpuCount, -1);
@@ -2587,7 +2577,7 @@ static void BuildPCIeTree()
     hipError_t err = hipDeviceGetPCIBusId(hipPciBusId, sizeof(hipPciBusId), i);
     if (err != hipSuccess) 
     {
-      std::cerr << "Failed to get PCI Bus ID for HIP device " << i << ": " << hipGetErrorString(err) << std::endl;
+      printf("Failed to get PCI Bus ID for HIP device %d: %s\n", i, hipGetErrorString(err));
       return;   
     }
     InsertPCIePathToTree(&pcie_root, hipPciBusId, "GPU " + std::to_string(i));
@@ -2600,7 +2590,7 @@ static int GetClosestRdmaNicId(int hipDeviceId)
   hipError_t err = hipDeviceGetPCIBusId(hipPciBusId, sizeof(hipPciBusId), hipDeviceId);
   if (err != hipSuccess) 
   {
-    std::cerr << "Failed to get PCI Bus ID for HIP device " << hipDeviceId << ": " << hipGetErrorString(err) << std::endl;
+    printf("Failed to get PCI Bus ID for HIP device %d: %s\n", hipDeviceId, hipGetErrorString(err));
     return -1;
   }
   int closestRdmaNicId = GetNearestPcieDeviceInTree(pcie_root, hipPciBusId, IbDeviceBusIds);
@@ -2640,7 +2630,7 @@ static int GetClosestGpuDeviceId(int IbvDeviceId)
     hipError_t err = hipDeviceGetPCIBusId(hipPciBusId, sizeof(hipPciBusId), i);
     if (err != hipSuccess) 
     {
-      std::cerr << "Failed to get PCI Bus ID for HIP device " << i << ": " << hipGetErrorString(err) << std::endl;
+      printf("Failed to get PCI Bus ID for HIP device %d: %s\n", i, hipGetErrorString(err));
       return -1;
     }
     int distance = GetBusIdDistance(hipPciBusId, address);
@@ -2677,19 +2667,19 @@ static void InitDeviceMappings()
         }
         else
         {
-          std::cerr << "[Error] Invalid NIC ID in CLOSEST_NIC environment variable: " << nicId << std::endl;
+            printf("[Error] Invalid NIC ID in CLOSEST_NIC environment variable: %d\n", nicId);
           exit(1);
         }        
       }
       catch (const std::invalid_argument& e)
       {
-        std::cerr << "[Error] Invalid NIC ID in CLOSEST_NIC environment variable: " << token << std::endl;
+        printf("[Error] Invalid NIC ID in CLOSEST_NIC environment variable: %s\n", token.c_str());
         exit(1);
       }
     }
     if(i < GpuCount)
     {
-      std::cerr << "[Error] Number of entries in CLOSEST_NIC environment variable is less than the number of detected GPUs: " << GpuCount<< std::endl;
+      printf("[Error] Number of entries in CLOSEST_NIC environment variable is less than the number of detected GPUs: %d\n", GpuCount);
       exit(1);
     }
   }
@@ -2720,12 +2710,12 @@ static void PrintPCIeTree(PCIe_tree   const& node,
 {
   if(!node.address.empty())
   {
-    std::cout << prefix << (isLast ? "└── " : "├── ") << node.address;
+    printf("%s%s%s", prefix.c_str(), (isLast ? "└── " : "├── "), node.address.c_str());
     if(!node.description.empty())
     {
-      std::cout << "(" << node.description << ")";
+      printf("(%s)", node.description.c_str());
     }
-    std::cout<< std::endl;
+    printf("\n");
   }
   const auto& children = node.children;
   for (auto it = children.begin(); it != children.end(); ++it)
@@ -2924,8 +2914,7 @@ static bool IsConfiguredGid(union ibv_gid* gid)
 static bool LinkLocalGid(union ibv_gid* gid)
 {
   const struct in6_addr *a = (struct in6_addr *)gid->raw;
-  if (a->s6_addr32[0] == htonl(0xfe800000) && a->s6_addr32[1] == 0UL)
-  {
+  if (a->s6_addr32[0] == htonl(0xfe800000) && a->s6_addr32[1] == 0UL) {
     return true;
   }
   return false;
@@ -3777,12 +3766,15 @@ static ErrResult TeardownRdma(TransferResources & resources)
       ERR_CHECK(ParseMemType(dstStr, transfer.dsts));
       ERR_CHECK(ParseExeType(exeStr, transfer.exeDevice, transfer.exeSubIndex));
       if(IsRdmaExeType(transfer.exeDevice.exeType)) {
+#ifndef RDMA_EXEC
+        return {ERR_FATAL, "IB Verbs executor is requested but is not available"};
+#endif
         ExeDevice exeDevice; 
         ERR_CHECK(ParseExeType(dstExeStr, exeDevice, transfer.exeSubIndex));
         transfer.exeDstIndex = exeDevice.exeIndex;
         if(transfer.exeDevice.exeType == EXE_IBV_NEAREST) {
-          transfer.exeDevice.exeIndex = GetClosestRdmaNicId(transfer.exeDevice.exeIndex);
-          transfer.exeDstIndex        = GetClosestRdmaNicId(transfer.exeDstIndex);
+          transfer.exeDevice.exeIndex = GetClosestNicToGpu(transfer.exeDevice.exeIndex);
+          transfer.exeDstIndex        = GetClosestNicToGpu(transfer.exeDstIndex);
         }
       }  
       transfers.push_back(transfer);
@@ -3923,64 +3915,22 @@ static ErrResult TeardownRdma(TransferResources & resources)
     return -1;
 #endif
   }
-  void PrintNicToGPUTopo(bool printAsCsv)
+
+  std::vector<int> GetClosestGpusToNic(int nicIndex)
   {
+    std::vector<int> closestGpus;    
 #ifdef RDMA_EXEC
     InitDeviceMappings();
-    if (printAsCsv)
-    {
-      std::cout << "Device Index,Device Name,Port Active,Closest GPU(s)" << std::endl;
+    if(nicIndex >= NicToGpuMapper.size()) {
+      printf("[Warning] NIC index %d is out of range. No GPUs found.\n", nicIndex);
+      return closestGpus;
     }
-    else
-    {
-      std::cout << "Device Index | Device Name | Port Active | Closest GPU(s)| PCIe Bus ID" << std::endl;
-      std::cout << "-------------+-------------+-------------+---------------+------------" << std::endl;
+    for (auto it = NicToGpuMapper[nicIndex].begin(); it != NicToGpuMapper[nicIndex].end(); ++it) {
+      closestGpus.push_back(*it);
     }
-
-    for (int i = 0; i < IbDeviceBusIds.size(); ++i)
-    {
-      std::string nicDevice = DeviceNames[i];
-      bool portActive = IbDeviceBusIds[i] != "";
-      std::string closestGpus;
-      for (auto it = NicToGpuMapper[i].begin(); it != NicToGpuMapper[i].end(); ++it)
-      {
-        closestGpus += std::to_string(*it);
-        if (std::next(it) != NicToGpuMapper[i].end())
-        {
-          closestGpus += ",";
-        }
-      }
-      if (printAsCsv)
-      {
-        std::cout << i << ","
-            << nicDevice << "," 
-            << (portActive ? "Yes" : "No") << ","
-            << closestGpus <<  ","
-            << IbDeviceBusIds[i] <<std::endl;
-      }
-      else
-      {
-        std::cout << std::left << std::setw(12) << i << " | "
-            << std::left << std::setw(11) << nicDevice << " | "
-            << std::left << std::setw(11) << (portActive ? "Yes" : "No") << " | "
-            << std::left << std::setw(13) << closestGpus << " | "
-            << std::left << std::setw(11) << IbDeviceBusIds[i] 
-            << std::endl;
-      }
-    }
-    std::cout << std::endl;
-    if (std::getenv("SHOW_TOPO_TREE"))
-    {
-      std::cout << "--------------------------" << std::endl;
-      std::cout << "PCIe Tree (NICs and GPUs):" << std::endl;
-      std::cout << "--------------------------" << std::endl;
-      PrintPCIeTree(pcie_root);
-      std::cout << std::endl;
-    }
-#endif    
+#endif
+    return closestGpus;
   }
-
-
 
 // Undefine CUDA compatibility macros
 #if defined(__NVCC__)

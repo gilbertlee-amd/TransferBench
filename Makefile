@@ -19,7 +19,14 @@ endif
 CXXFLAGS = -I$(ROCM_PATH)/include -lnuma -L$(ROCM_PATH)/lib -lhsa-runtime64
 NVFLAGS  = -x cu -lnuma -arch=native
 COMMON_FLAGS = -O3 --std=c++20 -I./src/header -I./src/client -I./src/client/Presets
-LDFLAGS += -lpthread -libverbs
+LDFLAGS += -lpthread
+
+# Compile RDMA executor if IBVerbs is found in the Dynamic Linker cache
+ifneq ("$(shell ldconfig -p | grep -c ibverbs)", "0")
+	CXXFLAGS += -DRDMA_EXEC
+	LDFLAGS += -libverbs
+	NVFLAGS += -libverbs -DRDMA_EXEC
+endif
 
 all: $(EXE)
 

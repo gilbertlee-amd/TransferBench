@@ -24,6 +24,11 @@ THE SOFTWARE.
 
 #include "TransferBench.hpp"
 
+#ifdef RDMA_EXEC
+#include <infiniband/verbs.h>
+#include <filesystem>
+#endif
+
 static int RemappedCpuIndex(int origIdx)
 {
   static std::vector<int> remappingCpu;
@@ -36,6 +41,90 @@ static int RemappedCpuIndex(int origIdx)
         remappingCpu.push_back(node);
   }
   return remappingCpu[origIdx];
+}
+
+static void PrintNicToGPUTopo(bool outputToCsv) 
+{
+#ifdef RDMA_EXEC    
+    if (outputToCsv) {
+      printf("Device Index,Device Name,Port Active,Closest GPU(s),PCIe Bus ID\n");
+    }
+    else {
+      printf("Device Index | Device Name | Port Active | Closest GPU(s) | PCIe Bus ID\n");
+      printf("-------------+-------------+-------------+----------------+------------\n");
+    }
+    std::vector<std::string> devBusIds;
+    std::vector<std::string> devNames;
+    std::vector<bool> devPortsActive;
+    int devCount; 
+    struct ibv_device **deviceList = ibv_get_device_list(&devCount);
+    if (deviceList && devCount > 0) {
+      devBusIds.resize(devCount, "");
+      devNames.resize(devCount, "");
+      devPortsActive.resize(devCount, false);
+      for (int i = 0; i < devCount; ++i) {
+        struct ibv_context *ctx = ibv_open_device(deviceList[i]);
+        if (ctx) {
+          struct ibv_device_attr deviceAttr;
+          if (ibv_query_device(ctx, &deviceAttr) == 0) {
+            devNames[i] = deviceList[i]->name;
+            for (int port = 1; port <= deviceAttr.phys_port_cnt; ++port) {
+              struct ibv_port_attr portAttr;
+              if (ibv_query_port(ctx, port, &portAttr) == 0 && portAttr.state == IBV_PORT_ACTIVE) {
+                devPortsActive[i] = true;
+                break;              
+              }
+            }
+          }
+
+          std::string devicePath(deviceList[i]->dev_path);
+          if (std::filesystem::exists(devicePath))
+          {
+            std::string pciPath = std::filesystem::canonical(devicePath + "/device").string();
+            std::size_t pos = pciPath.find_last_of('/');
+            if (pos != std::string::npos) {
+              std::string nicBusId = pciPath.substr(pos + 1);
+              devBusIds[i] = nicBusId;              
+            }
+          }
+          ibv_close_device(ctx);
+        }
+      }
+      ibv_free_device_list(deviceList);
+    }
+    for (int i = 0; i < devBusIds.size(); ++i)
+    {
+      std::string nicDevice = devNames[i];
+      bool portActive = devPortsActive[i];
+
+      auto closestGpus = GetClosestGpusToNic(i);
+      std::string closestGpusStr;
+      for (size_t j = 0; j < closestGpus.size(); ++j) {
+        closestGpusStr += std::to_string(closestGpus[j]);
+        if (j < closestGpus.size() - 1) {
+          closestGpusStr += ",";
+        }
+      }
+     
+      if (outputToCsv) {
+        printf("%d,%s,%s,%s,%s\n", 
+               i, 
+               nicDevice.c_str(), 
+               portActive ? "Yes" : "No", 
+               closestGpusStr.c_str(), 
+               devBusIds[i].c_str());
+      }
+      else {
+        printf("%-12d | %-11s | %-11s | %-13s | %-11s\n", 
+               i, 
+               nicDevice.c_str(), 
+               portActive ? "Yes" : "No", 
+               closestGpusStr.c_str(), 
+               devBusIds[i].c_str());
+      }
+    }
+    printf("\n");
+#endif
 }
 
 void DisplayTopology(bool outputToCsv)
@@ -94,9 +183,7 @@ void DisplayTopology(bool outputToCsv)
   printf("\n");
 
   // Print out detected NIC topology
-  TransferBench::PrintNicToGPUTopo(outputToCsv);
-
-  // Print out detected GPU topology
+  PrintNicToGPUTopo(outputToCsv);  
 
 #if defined(__NVCC__)
   for (int i = 0; i < numGpus; i++) {
