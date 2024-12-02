@@ -218,6 +218,7 @@ void PrintResults(EnvVars const& ev, int const testNum,
     ExeResult const& exeResult = exeInfoPair.second;
     ExeType const    exeType   = exeDevice.exeType;
     int32_t const    exeIndex  = exeDevice.exeIndex;
+    int32_t const    dstExeIndex  = exeDevice.exeIndex;
 
     printf(" Executor: %3s %02d %c %7.3f GB/s %c %8.3f ms %c %12lu bytes %c %-7.3f GB/s (sum)\n",
            ExeTypeName[exeType], exeIndex, sep, exeResult.avgBandwidthGbPerSec, sep,
@@ -232,13 +233,25 @@ void PrintResults(EnvVars const& ev, int const testNum,
       if (t.exeSubIndex != -1)
         sprintf(exeSubIndexStr, ".%d", t.exeSubIndex);
 
-      printf("     Transfer %02d  %c %7.3f GB/s %c %8.3f ms %c %12lu bytes %c %s -> %s%02d%s:%03d -> %s\n",
-             idx,                    sep,
-             r.avgBandwidthGbPerSec, sep,
-             r.avgDurationMsec,      sep,
-             r.numBytes,             sep,
-             MemDevicesToStr(t.srcs).c_str(), ExeTypeName[exeType], exeIndex,
-             exeSubIndexStr, t.numSubExecs, MemDevicesToStr(t.dsts).c_str());
+      if(exeType == EXE_IBV || exeType == EXE_IBV_NEAREST) {
+        printf("      Transfer %02d %c %7.3f GB/s %c %8.3f ms %c %12lu bytes %c %s -> %s%02d:%s%02d -> %s\n",
+              idx,                    sep,
+              r.avgBandwidthGbPerSec, sep,
+              r.avgDurationMsec,      sep,
+              r.numBytes,             sep,
+              MemDevicesToStr(t.srcs).c_str(),
+              ExeTypeName[exeType], exeIndex,
+              ExeTypeName[exeType], t.exeDstIndex,
+              MemDevicesToStr(t.dsts).c_str());
+      } else {
+        printf("     Transfer %02d  %c %7.3f GB/s %c %8.3f ms %c %12lu bytes %c %s -> %s%02d%s:%03d -> %s\n",
+              idx,                    sep,
+              r.avgBandwidthGbPerSec, sep,
+              r.avgDurationMsec,      sep,
+              r.numBytes,             sep,
+              MemDevicesToStr(t.srcs).c_str(), ExeTypeName[exeType], exeIndex,
+              exeSubIndexStr, t.numSubExecs, MemDevicesToStr(t.dsts).c_str());
+      }
 
       // Show per-iteration timing information
       if (ev.showIterations) {
