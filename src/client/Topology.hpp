@@ -24,7 +24,7 @@ THE SOFTWARE.
 
 #include "TransferBench.hpp"
 
-#ifdef RDMA_EXEC
+#ifndef NO_IBV_EXEC
 #include <infiniband/verbs.h>
 #include <filesystem>
 #endif
@@ -45,7 +45,7 @@ static int RemappedCpuIndex(int origIdx)
 
 static void PrintNicToGPUTopo(bool outputToCsv) 
 {
-#ifdef RDMA_EXEC    
+#ifndef NO_IBV_EXEC    
     if (outputToCsv) {
       printf("Device Index,Device Name,Port Active,Closest GPU(s),PCIe Bus ID\n");
     }

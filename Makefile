@@ -22,10 +22,12 @@ COMMON_FLAGS = -O3 --std=c++20 -I./src/header -I./src/client -I./src/client/Pres
 LDFLAGS += -lpthread
 
 # Compile RDMA executor if IBVerbs is found in the Dynamic Linker cache
-ifneq ("$(shell ldconfig -p | grep -c ibverbs)", "0")
-	CXXFLAGS += -DRDMA_EXEC
+ifneq ("$(shell ldconfig -p | grep -c ibverbs)", "0")	
 	LDFLAGS += -libverbs
-	NVFLAGS += -libverbs -DRDMA_EXEC
+	NVFLAGS += -libverbs
+else 
+	CXXFLAGS += -DNO_IBV_EXEC
+	NVFLAGS += -DNO_IBV_EXEC
 endif
 
 all: $(EXE)

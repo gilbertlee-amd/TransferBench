@@ -32,7 +32,7 @@ THE SOFTWARE.
 #include <thread>
 #include <vector>
 
-#ifdef RDMA_EXEC
+#ifndef NO_IBV_EXEC
 #include <infiniband/verbs.h>
 #include <stdio.h>
 #include <string.h>
@@ -1192,7 +1192,7 @@ namespace {
   };
 
   // RDMA NIC resource 
-#ifdef RDMA_EXEC
+#ifndef NO_IBV_EXEC
   struct NicResources
   {
     ibv_pd *protectionDomain = nullptr;        ///< Protection domain for RDMA operations
@@ -1224,7 +1224,7 @@ namespace {
     hsa_amd_sdma_engine_id_t   sdmaEngineId;      ///< DMA engine ID
 #endif
 
-#ifdef RDMA_EXEC
+#ifndef NO_IBV_EXEC
     vector<NicResources*> rdmaResourceMapper;    ///< Store resoruce sensitive RDMA fields
     vector<pair<ibv_mr *, void*>> sourceMr;      ///< Memory region for the source buffer
     vector<pair<ibv_mr *, void*>> destinationMr; ///< Memory region for the destination buffer
@@ -1434,7 +1434,7 @@ namespace {
 
     return ERR_NONE;
   }
-#ifdef RDMA_EXEC
+#ifndef NO_IBV_EXEC
 static ErrResult InitRdmaTransferResources(Transfer          const& transfer,
                                            TransferResources &      resources,
                                            RdmaOptions       const& rdmaOptions);
@@ -1581,7 +1581,7 @@ static ErrResult TeardownRdma(TransferResources & resources);
       ERR_CHECK(hipDeviceSynchronize());
     }
     if (IsRdmaExeType(exeDevice.exeType)) {
-#ifdef RDMA_EXEC
+#ifndef NO_IBV_EXEC
     for (auto& resources : exeInfo.resources) {
       Transfer const& t = transfers[resources.transferIdx];
       ERR_CHECK(InitRdmaTransferResources(t,
@@ -1632,7 +1632,7 @@ static ErrResult TeardownRdma(TransferResources & resources);
         ERR_CHECK(hsa_signal_destroy(resources.signal));
       }
 #endif
-#ifdef RDMA_EXEC
+#ifndef NO_IBV_EXEC
       if(IsRdmaExeType(exeDevice.exeType)) {
         ERR_CHECK(TeardownRdma(resources));
       }
@@ -1759,7 +1759,7 @@ static ErrResult TeardownRdma(TransferResources & resources);
     return ERR_NONE;
   }
 
-#ifdef RDMA_EXEC
+#ifndef NO_IBV_EXEC
   // Execution of a single Rdma Transfer
   static void ExecuteRdmaTransfer(int           const  iteration,
                                   ConfigOptions const& cfg,
@@ -2253,7 +2253,7 @@ static ErrResult TeardownRdma(TransferResources & resources);
 // IB Verbs-related functions
 //========================================================================================
 
-#ifdef RDMA_EXEC
+#ifndef NO_IBV_EXEC
 #define MAX_SEND_WR_PER_QP 12
 #define MAX_RECV_WR_PER_QP 12
 const unsigned int rdmaFlags = IBV_ACCESS_LOCAL_WRITE    |
@@ -2586,6 +2586,7 @@ static void BuildPCIeTree()
 
 static int GetClosestRdmaNicId(int hipDeviceId)
 {   
+  BuildPCIeTree();
   char hipPciBusId[64];
   hipError_t err = hipDeviceGetPCIBusId(hipPciBusId, sizeof(hipPciBusId), hipDeviceId);
   if (err != hipSuccess) 
@@ -3397,7 +3398,7 @@ static ErrResult TeardownRdma(TransferResources & resources)
   }
   return ERR_NONE;
 }
-#endif // end of the RDMA_EXEC code 
+#endif // end of the IBV_EXEC code 
 
 // Executor-related functions
 //========================================================================================
@@ -3410,7 +3411,7 @@ static ErrResult TeardownRdma(TransferResources & resources)
     case EXE_CPU:     return RunCpuExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
     case EXE_GPU_GFX: return RunGpuExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
     case EXE_GPU_DMA: return RunDmaExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
-#ifdef RDMA_EXEC
+#ifndef NO_IBV_EXEC
     case EXE_IBV: case EXE_IBV_NEAREST: return RunRdmaExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
 #endif
     default:          return {ERR_FATAL, "Unsupported executor (%d)", exeDevice.exeType};
@@ -3766,7 +3767,7 @@ static ErrResult TeardownRdma(TransferResources & resources)
       ERR_CHECK(ParseMemType(dstStr, transfer.dsts));
       ERR_CHECK(ParseExeType(exeStr, transfer.exeDevice, transfer.exeSubIndex));
       if(IsRdmaExeType(transfer.exeDevice.exeType)) {
-#ifndef RDMA_EXEC
+#ifdef NO_IBV_EXEC
         return {ERR_FATAL, "IB Verbs executor is requested but is not available"};
 #endif
         ExeDevice exeDevice; 
@@ -3794,7 +3795,7 @@ static ErrResult TeardownRdma(TransferResources & resources)
       if (status != hipSuccess) numDetectedGpus = 0;
       return numDetectedGpus;
     }
-#ifdef RDMA_EXEC
+#ifndef NO_IBV_EXEC
     case EXE_IBV: case EXE_IBV_NEAREST:
     {
       int numDetectedNics = 0;      
@@ -3909,7 +3910,7 @@ static ErrResult TeardownRdma(TransferResources & resources)
   }
   int GetClosestNicToGpu(int gpuIndex)
   {
-#ifdef RDMA_EXEC
+#ifndef NO_IBV_EXEC
     return GetClosestRdmaNicId(gpuIndex);
 #else
     return -1;
@@ -3919,7 +3920,7 @@ static ErrResult TeardownRdma(TransferResources & resources)
   std::vector<int> GetClosestGpusToNic(int nicIndex)
   {
     std::vector<int> closestGpus;    
-#ifdef RDMA_EXEC
+#ifndef NO_IBV_EXEC
     InitDeviceMappings();
     if(nicIndex >= NicToGpuMapper.size()) {
       printf("[Warning] NIC index %d is out of range. No GPUs found.\n", nicIndex);
