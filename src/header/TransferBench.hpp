@@ -2263,11 +2263,8 @@ const unsigned int rdmaFlags = IBV_ACCESS_LOCAL_WRITE    |
 #define IB_PSN  0
 #define INIT_ONCE(flag)\
   do {                 \
-  if(flag)             \
-  {                    \
-    return;            \
-  }                    \
-  flag = true;         \
+  if(flag) return;     \
+  else flag = true;    \
   } while(0);
 
 const  uint64_t WR_ID = 1789;
