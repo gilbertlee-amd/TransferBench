@@ -158,7 +158,7 @@ public:
     ibPort            = GetEnvVar("IB_PORT_NUMBER"      , 1);
     roceVersion       = GetEnvVar("ROCE_VERSION"        , 2);
     ipAddressFamily   = GetEnvVar("IP_ADDRESS_FAMILY"   , 4);
-    closestNicStr        = GetEnvVar("CLOSEST_NIC"         , "");
+    closestNicStr     = GetEnvVar("CLOSEST_NIC"         , "");
 
     gpuMaxHwQueues    = GetEnvVar("GPU_MAX_HW_QUEUES"   , 4);
     
