@@ -3734,6 +3734,10 @@ static ErrResult TeardownRdma(TransferResources & resources)
         iss >> dstStr;
         transfer.numSubExecs = numSubExecs;
         if (iss.fail()) {
+          if (IsRdmaExeType(exeType)) {
+            return {ERR_FATAL,
+                    "Parsing error: Unable to read valid Transfer %d (SRC SRC_EXE DST_EXE DST) triplet", i+1};   
+          }
           return {ERR_FATAL,
                   "Parsing error: Unable to read valid Transfer %d (SRC EXE DST) triplet", i+1};
         }
@@ -3746,10 +3750,18 @@ static ErrResult TeardownRdma(TransferResources & resources)
         }
         iss >> dstStr >> transfer.numSubExecs >> numBytesToken;
         if (iss.fail()) {
+          if (IsRdmaExeType(exeType)) {
+            return {ERR_FATAL,
+                  "Parsing error: Unable to read valid Transfer %d (SRC SRC_EXE DST_EXE DST $CU #Bytes) tuple", i+1};
+          }
           return {ERR_FATAL,
                   "Parsing error: Unable to read valid Transfer %d (SRC EXE DST $CU #Bytes) tuple", i+1};
         }
         if (sscanf(numBytesToken.c_str(), "%lu", &transfer.numBytes) != 1) {
+          if(IsRdmaExeType(exeType)) {
+            return {ERR_FATAL,
+                   "Parsing error: Unable to read valid Transfer %d (SRC SRC_EXE DST_EXE DST #CU #Bytes) tuple", i+1};
+          }
           return {ERR_FATAL,
                   "Parsing error: Unable to read valid Transfer %d (SRC EXE DST #CU #Bytes) tuple", i+1};
         }
