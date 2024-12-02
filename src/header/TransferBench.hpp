@@ -178,7 +178,7 @@ namespace TransferBench
   {
     int ibGidIndex   =-1;                       ///< GID Index for RoCE NICs (-1 is auto)
     int roceVersion  = 2;                       ///< RoCE version (used for auto GID detection)
-    int ipAddressFamily = 4;                    ///< 4=IPv4, 6=IPv6 (used for auto GID detection)
+    int ipAddressFamily = 4;                    ///< 4=IPv4, 6=IPv6 (used for auto GID detection)    
     uint8_t ibPort   = 1;                       ///< NIC port number to be used
   };
 
@@ -379,6 +379,13 @@ namespace TransferBench
    * @returns A vector of GPU IDs closest to the NIC
    */
   std::vector<int> GetClosestGpusToNic(int nicIndex);
+  
+  /**
+   * Sets the closest NICs for each GPU
+   *
+   * @param[in] closestNics Vector of NIC indices closest to each GPU
+   */
+  void SetClosestNics(const std::vector<int>& closestNics);
 
   /**
    * Helper function to parse a line containing Transfers into a vector of Transfers
@@ -2584,8 +2591,7 @@ static void BuildPCIeTree()
 }
 
 static int GetClosestRdmaNicId(int hipDeviceId)
-{   
-  BuildPCIeTree();
+{  
   char hipPciBusId[64];
   hipError_t err = hipDeviceGetPCIBusId(hipPciBusId, sizeof(hipPciBusId), hipDeviceId);
   if (err != hipSuccess) 
@@ -2644,57 +2650,17 @@ static int GetClosestGpuDeviceId(int IbvDeviceId)
 }
 
 static void InitDeviceMappings()
-{
-  INIT_ONCE(DeviceMappingInit);
+{  
+  INIT_ONCE(DeviceMappingInit);    
   BuildPCIeTree();
-  const char* closestNicEnv = std::getenv("CLOSEST_NIC");
-  if (closestNicEnv)
-  {
-    std::istringstream iss(closestNicEnv);
-    std::string token;
-    int i = 0; 
-    while (std::getline(iss, token, ','))
-    {
-      try
-      {
-        int nicId = std::stoi(token);
-        if (nicId >= 0 && nicId < RdmaNicCount)
-        {
-          GpuToNicMapper[i] = nicId;
-          assert(nicId < NicToGpuMapper.size());
-          NicToGpuMapper[nicId].insert(i);
-          i++;
-        }
-        else
-        {
-          printf("[Error] Invalid NIC ID in CLOSEST_NIC environment variable: %d\n", nicId);
-          exit(1);
-        }        
-      }
-      catch (const std::invalid_argument& e)
-      {
-        printf("[Error] Invalid NIC ID in CLOSEST_NIC environment variable: %s\n", token.c_str());
-        exit(1);
-      }
-    }
-    if(i < GpuCount)
-    {
-      printf("[Error] Number of entries in CLOSEST_NIC environment variable is less than the number of detected GPUs: %d\n", GpuCount);
-      exit(1);
+  for (int i = 0; i < GpuCount; ++i) {
+    int closestIbDevice = GetClosestRdmaNicId(i);
+    GpuToNicMapper[i] = closestIbDevice;
+    if(closestIbDevice >= 0) {
+      assert(closestIbDevice < NicToGpuMapper.size());
+      NicToGpuMapper[closestIbDevice].insert(i);
     }
   }
-  else 
-  {
-    for (int i = 0; i < GpuCount; ++i) {
-      int closestIbDevice = GetClosestRdmaNicId(i);
-      GpuToNicMapper[i] = closestIbDevice;
-      if(closestIbDevice >= 0)
-      {
-        assert(closestIbDevice < NicToGpuMapper.size());
-        NicToGpuMapper[closestIbDevice].insert(i);
-      }
-    }
-  }  
 }
 
 static int GetClosestIbDevice(int hipDeviceId)
@@ -3920,9 +3886,14 @@ static ErrResult TeardownRdma(TransferResources & resources)
 #endif
   }
   int GetClosestNicToGpu(int gpuIndex)
-  {
+  {    
 #ifndef NO_IBV_EXEC
-    return GetClosestRdmaNicId(gpuIndex);
+    InitDeviceMappings();
+    if(gpuIndex >= GpuToNicMapper.size() || gpuIndex < 0) {
+      printf("[Warning] GPU device index %d is out of range. \n", gpuIndex);
+      return -1;
+    }
+    return GpuToNicMapper[gpuIndex];
 #else
     return -1;
 #endif
@@ -3942,6 +3913,34 @@ static ErrResult TeardownRdma(TransferResources & resources)
     }
 #endif
     return closestGpus;
+  }
+
+  void SetClosestNics(const std::vector<int>& closestNics) 
+  {    
+#ifndef NO_IBV_EXEC    
+    InitDeviceMappings();
+    if (closestNics.size() > 0) {
+      if(closestNics.size() < GpuCount) {
+        printf("[Error] Invalid number of entries in user-specified closest NICs. Specified: %zu. Available: %d.\n", closestNics.size(), GpuCount);
+        exit(1);
+      }
+      NicToGpuMapper.clear();
+      GpuToNicMapper.clear();
+      NicToGpuMapper.resize(RdmaNicCount);
+      GpuToNicMapper.resize(GpuCount, -1);
+      for(int i = 0; i < closestNics.size(); ++i) {      
+        int nicId = closestNics[i];
+        if (nicId >= 0 && nicId < RdmaNicCount) {
+          GpuToNicMapper[i] = nicId;
+          assert(nicId < NicToGpuMapper.size());
+          NicToGpuMapper[nicId].insert(i);          
+        } else {
+          printf("[Error] Invalid NIC ID in user-specified closest NICs: %d\n", nicId);
+          exit(1);
+        }              
+      }
+    } 
+#endif    
   }
 
 // Undefine CUDA compatibility macros

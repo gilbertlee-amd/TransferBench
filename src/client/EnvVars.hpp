@@ -105,6 +105,7 @@ public:
   int roceVersion;                   // RoCE version number
   int ipAddressFamily;               // IP Address Famliy
   uint8_t ibPort;                    // NIC port number to be used
+  std::string closestNicStr;            // Holds the user-specified list of closest NICs
 
   // Developer features
   int gpuMaxHwQueues;                // Tracks GPU_MAX_HW_QUEUES environment variable
@@ -157,8 +158,10 @@ public:
     ibPort            = GetEnvVar("IB_PORT_NUMBER"      , 1);
     roceVersion       = GetEnvVar("ROCE_VERSION"        , 2);
     ipAddressFamily   = GetEnvVar("IP_ADDRESS_FAMILY"   , 4);
+    closestNicStr        = GetEnvVar("CLOSEST_NIC"         , "");
 
     gpuMaxHwQueues    = GetEnvVar("GPU_MAX_HW_QUEUES"   , 4);
+    
 
     // Check for fill pattern
     char* pattern = getenv("FILL_PATTERN");
@@ -314,6 +317,7 @@ public:
     printf(" IB_PORT_NUMBER    - RDMA port count for RDMA NIC (default=1)\n");
     printf(" IP_ADDRESS_FAMILY - IP address family (4=v4, 6=v6, default=v4)\n");
     printf(" ROCE_VERSION      - RoCE version (default=2)\n");
+    printf(" CLOSEST_NIC       - Comma seperated list of per-GPU closest NIC (default=auto)\n");
   }
 
   void Print(std::string const& name, int32_t const value, const char* format, ...) const
@@ -404,6 +408,8 @@ public:
           "RoCE version is set to %d", roceVersion);
     Print("IP_ADDRESS_FAMILY", ipAddressFamily,
           "IP address family is set to IPv%d", ipAddressFamily);
+    Print("CLOSEST_NIC", (closestNicStr == "" ? "auto" : "user-input"),
+          "Per-GPU closest NIC is set as %s", (closestNicStr == "" ? "auto" : closestNicStr.c_str()));
 
     if (getenv("XCC_PREF_TABLE")) {
       printf("%36s: Preferred XCC Table (XCC_PREF_TABLE)\n", "");
@@ -506,7 +512,25 @@ public:
     cfg.rdma.ibPort                = ibPort;
     cfg.rdma.ipAddressFamily       = ipAddressFamily;
     cfg.rdma.roceVersion           = roceVersion;
-
+    std::vector<int> closestNics;
+    if(closestNicStr != "") {      
+      std::stringstream ss(closestNicStr);
+      std::string item;
+      while (std::getline(ss, item, ',')) {
+        try {
+          int nic = std::stoi(item);
+          if (nic < 0) {        
+            printf("[ERROR]: NIC index cannot be negative\n");
+            exit(1);
+          }
+          closestNics.push_back(nic);
+        } catch (const std::invalid_argument& e) {
+          printf("[ERROR] Invalid NIC index: %s\n", item.c_str());
+          exit(1);
+        }
+      }
+      TransferBench::SetClosestNics(closestNics);
+    }
     return cfg;
   }
 };
