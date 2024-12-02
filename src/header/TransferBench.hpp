@@ -2261,13 +2261,13 @@ const unsigned int rdmaFlags = IBV_ACCESS_LOCAL_WRITE    |
                                IBV_ACCESS_REMOTE_WRITE   |
                                IBV_ACCESS_REMOTE_ATOMIC;
 #define IB_PSN  0
-#define INIT_ONCE(ret)  \
-  do {                  \
-  if(Initialized)       \
-  {                     \
-    return ret;         \
-  }                     \
-  Initialized = true;   \
+#define INIT_ONCE(flag)\
+  do {                 \
+  if(flag)             \
+  {                    \
+    return;            \
+  }                    \
+  flag = true;         \
   } while(0);
 
 const  uint64_t WR_ID = 1789;
@@ -2278,7 +2278,8 @@ static std::vector<std::set<int>> NicToGpuMapper;
 static std::vector<int> GpuToNicMapper;
 static std::vector<std::string> DeviceNames;
 static int GpuCount;
-static bool Initialized = false;
+static bool DeviceMappingInit  = false;
+static bool PcieTreeInit = false;
 static bool MultiportFlag = false;
 
 class PCIe_tree 
@@ -2498,6 +2499,7 @@ static int GetNearestPcieDeviceInTree(PCIe_tree                const& root,
 
 static void BuildPCIeTree()
 {
+  INIT_ONCE(PcieTreeInit);
   struct ibv_device **dev_list;
   dev_list = ibv_get_device_list(&RdmaNicCount);
   if (!dev_list)
@@ -2646,7 +2648,7 @@ static int GetClosestGpuDeviceId(int IbvDeviceId)
 
 static void InitDeviceMappings()
 {
-  INIT_ONCE();  
+  INIT_ONCE(DeviceMappingInit);
   BuildPCIeTree();
   const char* closestNicEnv = std::getenv("CLOSEST_NIC");
   if (closestNicEnv)
