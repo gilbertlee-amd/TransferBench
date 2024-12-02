@@ -2668,7 +2668,7 @@ static void InitDeviceMappings()
         }
         else
         {
-            printf("[Error] Invalid NIC ID in CLOSEST_NIC environment variable: %d\n", nicId);
+          printf("[Error] Invalid NIC ID in CLOSEST_NIC environment variable: %d\n", nicId);
           exit(1);
         }        
       }
