@@ -30,6 +30,7 @@ THE SOFTWARE.
 #include <sstream>
 #include <stdarg.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 #ifndef NO_IBV_EXEC
@@ -61,7 +62,7 @@ namespace TransferBench
   using std::set;
   using std::vector;
 
-  constexpr char VERSION[] = "1.54";
+  constexpr char VERSION[] = "1.57";
 
   /**
    * Enumeration of supported Executor types
@@ -90,8 +91,9 @@ namespace TransferBench
     ExeType exeType;                            ///< Executor type
     int32_t exeIndex;                           ///< Executor index
 
-    // Default comparison operator
-    auto operator<=>(const ExeDevice&) const = default;
+    bool operator<(ExeDevice const& other) const {
+      return (exeType < other.exeType) || (exeType == other.exeType && exeIndex < other.exeIndex);
+    }
   };
 
   /**
@@ -120,7 +122,10 @@ namespace TransferBench
   {
     MemType memType;                            ///< Memory type
     int32_t memIndex;                           ///< Device index
-    auto operator<=>(const MemDevice&) const = default;
+
+    bool operator<(MemDevice const& other) const {
+      return (memType < other.memType) || (memType == other.memType && memIndex < other.memIndex);
+    }
   };
 
   /**
@@ -193,7 +198,7 @@ namespace TransferBench
     int                 unrollFactor   = 4;     ///< GFX-kernel unroll factor
     int                 useHipEvents   = 1;     ///< Use HIP events for timing GFX Executor
     int                 useMultiStream = 0;     ///< Use multiple streams for GFX
-    int                 useSingleTeam  = 1;     ///< Team all subExecutors across the data array
+    int                 useSingleTeam  = 0;     ///< Team all subExecutors across the data array
     int                 waveOrder      = 0;     ///< GFX-kernel wavefront ordering
   };
 
@@ -1520,7 +1525,6 @@ static ErrResult TeardownRdma(TransferResources & resources);
       int const numStreamsToUse = (exeDevice.exeType == EXE_GPU_DMA ||
                                    (exeDevice.exeType == EXE_GPU_GFX && cfg.gfx.useMultiStream))
         ? exeInfo.resources.size() : 1;
-
       exeInfo.streams.resize(numStreamsToUse);
 
       // Create streams
@@ -2015,6 +2019,8 @@ static ErrResult TeardownRdma(TransferResources & resources);
   // Execute a single GPU Transfer (when using 1 stream per Transfer)
   static ErrResult ExecuteGpuTransfer(int           const  iteration,
                                       hipStream_t   const  stream,
+                                      hipEvent_t    const  startEvent,
+                                      hipEvent_t    const  stopEvent,
                                       int           const  xccDim,
                                       ConfigOptions const& cfg,
                                       TransferResources&   resources)
@@ -2026,33 +2032,41 @@ static ErrResult TeardownRdma(TransferResources & resources);
     dim3 const blockSize(cfg.gfx.blockSize, 1);
 
 #if defined(__NVCC__)
+    if (startEvent != NULL)
+      ERR_CHECK(hipEventRecord(startEvent, stream));
+
     GpuKernelTable[cfg.gfx.blockSize/64 - 1][cfg.gfx.unrollFactor - 1]
       <<<gridSize, blockSize, 0, stream>>>
       (resources.subExecParamGpuPtr, cfg.gfx.waveOrder, cfg.general.numSubIterations);
+    if (stopEvent != NULL)
+      ERR_CHECK(hipEventRecord(stopEvent, stream));
 #else
     hipExtLaunchKernelGGL(GpuKernelTable[cfg.gfx.blockSize/64 - 1][cfg.gfx.unrollFactor - 1],
-                          gridSize, blockSize, 0, stream,
-                          NULL, NULL,
+                          gridSize, blockSize, 0, stream, startEvent, stopEvent,
                           0, resources.subExecParamGpuPtr, cfg.gfx.waveOrder, cfg.general.numSubIterations);
 #endif
 
     ERR_CHECK(hipStreamSynchronize(stream));
 
     auto cpuDelta = std::chrono::high_resolution_clock::now() - cpuStart;
-    double deltaMsec = std::chrono::duration_cast<std::chrono::duration<double>>(cpuDelta).count() * 1000.0;
+    double cpuDeltaMsec = std::chrono::duration_cast<std::chrono::duration<double>>(cpuDelta).count() * 1000.0;
 
     if (iteration >= 0) {
+      double deltaMsec = cpuDeltaMsec;
+      if (startEvent != NULL) {
+        float gpuDeltaMsec;
+        ERR_CHECK(hipEventElapsedTime(&gpuDeltaMsec, startEvent, stopEvent));
+        deltaMsec = gpuDeltaMsec;
+      }
       resources.totalDurationMsec += deltaMsec;
       if (cfg.general.recordPerIteration) {
         resources.perIterMsec.push_back(deltaMsec);
-#if !defined(__NVCC__)
         std::set<std::pair<int,int>> CUs;
         for (int i = 0; i < numSubExecs; i++) {
           CUs.insert(std::make_pair(resources.subExecParamGpuPtr[i].xccId,
                                     GetId(resources.subExecParamGpuPtr[i].hwId)));
         }
         resources.perIterCUs.push_back(CUs);
-#endif
       }
     }
     return ERR_NONE;
@@ -2077,6 +2091,8 @@ static ErrResult TeardownRdma(TransferResources & resources);
                                                ExecuteGpuTransfer,
                                                iteration,
                                                exeInfo.streams[i],
+                                               cfg.gfx.useHipEvents ? exeInfo.startEvents[i] : NULL,
+                                               cfg.gfx.useHipEvents ? exeInfo.stopEvents[i] : NULL,
                                                xccDim,
                                                std::cref(cfg),
                                                std::ref(exeInfo.resources[i])));
@@ -2113,7 +2129,7 @@ static ErrResult TeardownRdma(TransferResources & resources);
     double cpuDeltaMsec = std::chrono::duration_cast<std::chrono::duration<double>>(cpuDelta).count() * 1000.0;
 
     if (iteration >= 0) {
-      if (cfg.gfx.useHipEvents) {
+      if (cfg.gfx.useHipEvents && !cfg.gfx.useMultiStream) {
         float gpuDeltaMsec;
         ERR_CHECK(hipEventElapsedTime(&gpuDeltaMsec, exeInfo.startEvents[0], exeInfo.stopEvents[0]));
         exeInfo.totalDurationMsec += gpuDeltaMsec;
@@ -2122,34 +2138,31 @@ static ErrResult TeardownRdma(TransferResources & resources);
       }
 
       // Determine timing for each of the individual transfers that were part of this launch
-      for (int i = 0; i < exeInfo.resources.size(); i++) {
-        TransferResources& resources = exeInfo.resources[i];
-        long long minStartCycle = std::numeric_limits<long long>::max();
-        long long maxStopCycle  = std::numeric_limits<long long>::min();
-        std::set<std::pair<int, int>> CUs;
+      if (!cfg.gfx.useMultiStream) {
+        for (int i = 0; i < exeInfo.resources.size(); i++) {
+          TransferResources& resources = exeInfo.resources[i];
+          long long minStartCycle = std::numeric_limits<long long>::max();
+          long long maxStopCycle  = std::numeric_limits<long long>::min();
+          std::set<std::pair<int, int>> CUs;
 
-        for (auto subExecIdx : resources.subExecIdx) {
-          minStartCycle = std::min(minStartCycle, exeInfo.subExecParamGpu[subExecIdx].startCycle);
-          maxStopCycle  = std::max(maxStopCycle,  exeInfo.subExecParamGpu[subExecIdx].stopCycle);
-          if (cfg.general.recordPerIteration) {
-#if !defined(__NVCC__)
-            CUs.insert(std::make_pair(exeInfo.subExecParamGpu[subExecIdx].xccId,
-                                      GetId(exeInfo.subExecParamGpu[subExecIdx].hwId)));
-#endif
+          for (auto subExecIdx : resources.subExecIdx) {
+            minStartCycle = std::min(minStartCycle, exeInfo.subExecParamGpu[subExecIdx].startCycle);
+            maxStopCycle  = std::max(maxStopCycle,  exeInfo.subExecParamGpu[subExecIdx].stopCycle);
+            if (cfg.general.recordPerIteration) {
+              CUs.insert(std::make_pair(exeInfo.subExecParamGpu[subExecIdx].xccId,
+                                        GetId(exeInfo.subExecParamGpu[subExecIdx].hwId)));
+            }
           }
-        }
-        double deltaMsec = (maxStopCycle - minStartCycle) / (double)(exeInfo.wallClockRate);
+          double deltaMsec = (maxStopCycle - minStartCycle) / (double)(exeInfo.wallClockRate);
 
-        resources.totalDurationMsec += deltaMsec;
-        if (cfg.general.recordPerIteration) {
-          resources.perIterMsec.push_back(deltaMsec);
-#if !defined(__NVCC__)
-          resources.perIterCUs.push_back(CUs);
-#endif
+          resources.totalDurationMsec += deltaMsec;
+          if (cfg.general.recordPerIteration) {
+            resources.perIterMsec.push_back(deltaMsec);
+            resources.perIterCUs.push_back(CUs);
+          }
         }
       }
     }
-
     return ERR_NONE;
   }
 
@@ -3510,6 +3523,26 @@ static ErrResult TeardownRdma(TransferResources & resources)
       }
     }
 
+    // Pause before starting when running in iteractive mode
+    if (cfg.general.useInteractive) {
+      printf("Memory prepared:\n");
+
+      for (int i = 0; i < transfers.size(); i++) {
+        ExeInfo const& exeInfo = executorMap[transfers[i].exeDevice];
+        printf("Transfer %03d:\n", i);
+        for (int iSrc = 0; iSrc < transfers[i].srcs.size(); ++iSrc)
+          printf("  SRC %0d: %p\n", iSrc, transferResources[i]->srcMem[iSrc]);
+        for (int iDst = 0; iDst < transfers[i].dsts.size(); ++iDst)
+          printf("  DST %0d: %p\n", iDst, transferResources[i]->dstMem[iDst]);
+      }
+      printf("Hit <Enter> to continue: ");
+      if (scanf("%*c") != 0) {
+        printf("[ERROR] Unexpected input\n");
+        exit(1);
+      }
+      printf("\n");
+    }
+
     // Perform iterations
     size_t numTimedIterations = 0;
     double totalCpuTimeSec = 0.0;
@@ -3518,25 +3551,6 @@ static ErrResult TeardownRdma(TransferResources & resources)
       if (cfg.general.numIterations > 0 && iteration >= cfg.general.numIterations) break;
       if (cfg.general.numIterations < 0 && totalCpuTimeSec > -cfg.general.numIterations) break;
 
-      // Pause before starting first timed iteration in iteractive mode
-      if (cfg.general.useInteractive && iteration == 0) {
-        printf("Memory prepared:\n");
-
-        for (int i = 0; i < transfers.size(); i++) {
-          ExeInfo const& exeInfo = executorMap[transfers[i].exeDevice];
-          printf("Transfer %03d:\n", i);
-          for (int iSrc = 0; iSrc < transfers[i].srcs.size(); ++iSrc)
-            printf("  SRC %0d: %p\n", iSrc, exeInfo.resources[i].srcMem[iSrc]);
-          for (int iDst = 0; iDst < transfers[i].dsts.size(); ++iDst)
-            printf("  DST %0d: %p\n", iDst, exeInfo.resources[i].dstMem[iDst]);
-        }
-        printf("Hit <Enter> to continue: ");
-        if (scanf("%*c") != 0) {
-          printf("[ERROR] Unexpected input\n");
-          exit(1);
-        }
-        printf("\n");
-      }
 
       // Start CPU timing for this iteration
       auto cpuStart = std::chrono::high_resolution_clock::now();

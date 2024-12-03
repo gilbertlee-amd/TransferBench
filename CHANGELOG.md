@@ -3,6 +3,27 @@
 Documentation for TransferBench is available at
 [https://rocm.docs.amd.com/projects/TransferBench](https://rocm.docs.amd.com/projects/TransferBench).
 
+## v1.57.01
+### Added
+- Re-added "scaling" GPU GFX preset benchmark, which tests copies from GPU to other devices using varying
+  number of CUs.
+
+## v1.57.00
+### Modified
+- Removing use of default starship operator / C++20 requirement to enable compilation of more OSs
+- Changing how version is reported.  Client version is now just last two digits, and increments only if
+  no changes are made to the backend header-only library file, and resets to 0 when header is updated
+- GFX_SINGLE_TEAM=0 is set by default
+
+## v1.56
+### Fixed
+- Fixed bug when using interactive mode.  Interactive mode now starts prior to all warmup iterations
+
+## v1.55
+### Fixed
+- Fixed missing header error when compiling on CentOS
+- Fixed issues when using multi-stream mode for GFX executor
+
 ## v1.54
 ### Modified
 - Refactored TransferBench into a header-only library combined with a thin client to facilitate the
