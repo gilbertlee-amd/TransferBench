@@ -373,6 +373,7 @@ namespace TransferBench
    * Returns the index of the NIC closest to the given GPU
    *
    * @param[in] gpuIndex Index of the GPU to query
+   * @note This function is applicable when the IBV/RDMA executor is available
    * @returns IB Verbs capable NIC index closest to GPU gpuIndex, or -1 if unable to detect
    */
   int GetClosestNicToGpu(int gpuIndex);
@@ -380,6 +381,7 @@ namespace TransferBench
    /**
    * Returns the indices of the GPUs closest to a NIC using PCIe addressing scheme.
    * @note The size of the returned vector can be > 1 when GPUs > NICs
+   * @note This function is applicable when the IBV/RDMA executor is available
    * @param[in] nicIndex Index of the NIC based on the Ib Verbs device list
    * @returns A vector of GPU IDs closest to the NIC
    */
@@ -387,7 +389,7 @@ namespace TransferBench
   
   /**
    * Sets the closest NICs for each GPU
-   *
+   * @note This function only impacts the IBV/RDMA executor when it is available
    * @param[in] closestNics Vector of NIC indices closest to each GPU
    */
   void SetClosestNics(const std::vector<int>& closestNics);
@@ -2899,7 +2901,7 @@ static bool LinkLocalGid(union ibv_gid* gid)
   return false;
 }
 
-static bool isValidGid(union ibv_gid* gid)
+static bool IsValidGid(union ibv_gid* gid)
 {
   return (IsConfiguredGid(gid) && !LinkLocalGid(gid));
 }
@@ -3019,7 +3021,7 @@ static ErrResult UpdateGidIndex(struct ibv_context* const& context,
     *gidIndex = gidIndexCandidate;
   }
   else {
-    if (gidCandidateFam != usrFam || !isValidGid(&gidCandidate) || !gidCandidateMatchSubnet) {
+    if (gidCandidateFam != usrFam || !IsValidGid(&gidCandidate) || !gidCandidateMatchSubnet) {
       return ERR_NONE;
     }
     int usrRoceVer = roceVer;
@@ -3027,7 +3029,7 @@ static ErrResult UpdateGidIndex(struct ibv_context* const& context,
     const char* deviceName = ibv_get_device_name(context->device);
     ERR_CHECK(GetRoceVersionNumber(deviceName, portNum, *gidIndex, &gidRoceVerNum));    
     ERR_CHECK(GetRoceVersionNumber(deviceName, portNum, gidIndexCandidate, &gidRoceVerNumCandidate));    
-    if ((gidRoceVerNum != gidRoceVerNumCandidate || !isValidGid(&gid)) && gidRoceVerNumCandidate == usrRoceVer)
+    if ((gidRoceVerNum != gidRoceVerNumCandidate || !IsValidGid(&gid)) && gidRoceVerNumCandidate == usrRoceVer)
     {
       *gidIndex = gidIndexCandidate;
     }
