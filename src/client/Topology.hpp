@@ -185,6 +185,7 @@ void DisplayTopology(bool outputToCsv)
   // Print out detected NIC topology
   PrintNicToGPUTopo(outputToCsv);  
 
+  // Print out detected GPU topology
 #if defined(__NVCC__)
   for (int i = 0; i < numGpus; i++) {
     hipDeviceProp_t prop;
