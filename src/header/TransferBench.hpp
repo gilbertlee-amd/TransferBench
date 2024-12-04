@@ -2343,8 +2343,7 @@ static PCIe_tree pcie_root;
 static void InsertPCIePathToTree(PCIe_tree* root, const std::string& pcieAddress, const std::string& description)
 {
   std::filesystem::path devicePath = "/sys/bus/pci/devices/" + pcieAddress;
-  if (!std::filesystem::exists(devicePath))
-  {
+  if (!std::filesystem::exists(devicePath)) {
     printf("[ERROR] Device path %s does not exist\n", devicePath.c_str());
     return;
   }
@@ -2353,12 +2352,10 @@ static void InsertPCIePathToTree(PCIe_tree* root, const std::string& pcieAddress
   std::string token;
   PCIe_tree* currentNode = root;
 
-  while (std::getline(iss, token, '/'))
-  {
+  while (std::getline(iss, token, '/')) {
     std::string address = token;
     auto it = currentNode->children.find(PCIe_tree(address));
-    if (it == currentNode->children.end())
-    {
+    if (it == currentNode->children.end()) {
       currentNode->children.insert(PCIe_tree(address));
       it = currentNode->children.find(PCIe_tree(address));
     }
@@ -2369,26 +2366,21 @@ static void InsertPCIePathToTree(PCIe_tree* root, const std::string& pcieAddress
 
 static const PCIe_tree* getLcaBetweenNodes(const PCIe_tree* root, std::string node1, std::string node2)
 {
-  if (!root || root->address == node1 || root->address == node2)
-  {
+  if (!root || root->address == node1 || root->address == node2) {
     return root;
   }
 
   const PCIe_tree* leftLCA = nullptr;
   const PCIe_tree* rightLCA = nullptr;
 
-  for (const auto& child : root->children)
-  {
+  for (const auto& child : root->children) {
     const PCIe_tree* lca = getLcaBetweenNodes(&child, node1, node2);
-    if (lca)
-    {
-      if (leftLCA)
-      {
+    if (lca) {
+      if (leftLCA) {
         rightLCA = lca;
         break;
-      } 
-      else
-      {
+      }
+      else {
         leftLCA = lca;
       }
     }
@@ -2405,19 +2397,15 @@ static int GetLcaDepth(std::string      const& targetBusID,
                        const PCIe_tree* const& node,
                        int                     depth = 0)
 {
-  if (!node)
-  {
+  if (!node) {
     return -1;
-  }
-  if (targetBusID == node->address)
-  {
+  }  
+  if (targetBusID == node->address) {
     return depth;
   }
-  for (auto&& child : node->children)
-  {
+  for (auto&& child : node->children) {
     int distance = GetLcaDepth(targetBusID, &child, depth + 1);
-    if (distance != -1)
-    {
+    if (distance != -1) {
       return distance;
     }
   }
@@ -2433,8 +2421,7 @@ static int ExtractBusNumber(std::string const& pcieAddress)
   std::istringstream iss(pcieAddress);
   iss >> std::hex >> domain >> delimiter >> bus >> delimiter >> device >> delimiter >> function;
 
-  if (iss.fail())
-  {
+  if (iss.fail()) {
     printf("Invalid PCIe address format: %s\n", pcieAddress.c_str());
     return -1; // Invalid bus number
   }
@@ -2449,8 +2436,7 @@ static int GetBusIdDistance(std::string const& pcieAddress1,
   int bus1 = ExtractBusNumber(pcieAddress1);
   int bus2 = ExtractBusNumber(pcieAddress2);
 
-  if (bus1 == -1 || bus2 == -1)
-  {
+  if (bus1 == -1 || bus2 == -1) {
     return -1; // Error case, invalid bus number
   }
 
@@ -2465,22 +2451,17 @@ static int GetNearestPcieDeviceInTree(PCIe_tree                const& root,
   int max_depth = -1;
   int index_of_closest = -1;
   std::vector <int> matches;
-  for (const auto& targetBusID : targetBusIds)
-  {
+  for (const auto& targetBusID : targetBusIds) {
     if (targetBusID.empty()) continue;    
     const PCIe_tree* lca = getLcaBetweenNodes(&root, busID, targetBusID);
-    if (lca)
-    {
+    if (lca) {
       int depth = GetLcaDepth(lca->address, &pcie_root);
-      if (depth > max_depth)
-      {        
+      if (depth > max_depth) {  
         max_depth = depth;
         index_of_closest = &targetBusID - &targetBusIds[0];
         matches.clear(); // found a new max depth
         matches.push_back(index_of_closest);
-      }
-      else if(depth == max_depth && depth >= 0)
-      {
+      } else if(depth == max_depth && depth >= 0) {
         matches.push_back(&targetBusID - &targetBusIds[0]);
       }
     }
@@ -2489,16 +2470,12 @@ static int GetNearestPcieDeviceInTree(PCIe_tree                const& root,
   // bus id difference 
   // 2. Also cover when two NICs have the same busIds which indicates a dualport case 
   // (only two ports supported)
-  if(matches.size() > 1)
-  {
+  if(matches.size() > 1) {
     int minDistance = std::numeric_limits<int>::max();
-    for (int i = 0; i < matches.size(); ++i)
-    {
-      for(int j = i + 1; j < matches.size(); ++j)
-      {
+    for (int i = 0; i < matches.size(); ++i) {
+      for(int j = i + 1; j < matches.size(); ++j) {
         // Multiport NIC
-        if(ExtractBusNumber(targetBusIds[matches[i]]) == ExtractBusNumber(targetBusIds[matches[j]]))
-        {
+        if(ExtractBusNumber(targetBusIds[matches[i]]) == ExtractBusNumber(targetBusIds[matches[j]])) {
           index_of_closest = !MultiportFlag? matches[i] : matches[j];
           // Workaround to distribute ports over GPUs
           MultiportFlag = !MultiportFlag;
@@ -2506,8 +2483,7 @@ static int GetNearestPcieDeviceInTree(PCIe_tree                const& root,
         }
       }
       int distance = GetBusIdDistance(busID, targetBusIds[matches[i]]);
-      if (distance < minDistance)
-      {
+      if (distance < minDistance) {
         minDistance = distance;
         index_of_closest = matches[i];
       }      
@@ -2521,8 +2497,7 @@ static void BuildPCIeTree()
   INIT_ONCE(PcieTreeInit);
   struct ibv_device **dev_list;
   dev_list = ibv_get_device_list(&RdmaNicCount);
-  if (!dev_list)
-  {
+  if (!dev_list) {
     printf("Failed to get IB devices list.\n");
     return;
   }
@@ -2530,36 +2505,30 @@ static void BuildPCIeTree()
   NicToGpuMapper.resize(RdmaNicCount);
   DeviceNames.resize(RdmaNicCount);
 
-  for (int i = 0; i < RdmaNicCount; ++i)
-  {
+  for (int i = 0; i < RdmaNicCount; ++i) {
     struct ibv_device *device = dev_list[i];
     DeviceNames[i] = device->name;
     struct ibv_context *context = ibv_open_device(device);
-    if (!context)
-    {
+    if (!context) {
       printf("Failed to open device %s\n", device->name);
       continue;
     }
 
     struct ibv_device_attr device_attr;
-    if (ibv_query_device(context, &device_attr))
-    {
+    if (ibv_query_device(context, &device_attr)) {
       printf("Failed to query device attributes for %s\n", device->name);
       ibv_close_device(context);
       continue;
     }
 
     bool portActive = false;
-    for (int port = 1; port <= device_attr.phys_port_cnt; ++port)
-    {
+    for (int port = 1; port <= device_attr.phys_port_cnt; ++port) {
       struct ibv_port_attr port_attr;
-      if (ibv_query_port(context, port, &port_attr))
-      {
+      if (ibv_query_port(context, port, &port_attr)) {
         printf("Failed to query port %d attributes for %s\n", port, device->name);
         continue;
       }
-      if (port_attr.state == IBV_PORT_ACTIVE)
-      {
+      if (port_attr.state == IBV_PORT_ACTIVE) {
         portActive = true;
         break;
       }
@@ -2567,14 +2536,12 @@ static void BuildPCIeTree()
 
     ibv_close_device(context);
 
-    if (!portActive)
-    {        
+    if (!portActive) {        
       continue;
     }
 
     std::string device_path(device->dev_path);
-    if (std::filesystem::exists(device_path))
-    {
+    if (std::filesystem::exists(device_path)) {
       std::string pciPath = std::filesystem::canonical(device_path + "/device").string();
       std::size_t pos = pciPath.find_last_of('/');
       if (pos != std::string::npos) {
@@ -2592,12 +2559,10 @@ static void BuildPCIeTree()
     return;
   }
   GpuToNicMapper.resize(GpuCount, -1);
-  for (int i = 0; i < GpuCount; ++i)
-  {
+  for (int i = 0; i < GpuCount; ++i) {
     char hipPciBusId[64];
     hipError_t err = hipDeviceGetPCIBusId(hipPciBusId, sizeof(hipPciBusId), i);
-    if (err != hipSuccess) 
-    {
+    if (err != hipSuccess) {
       printf("Failed to get PCI Bus ID for HIP device %d: %s\n", i, hipGetErrorString(err));
       return;   
     }
@@ -2609,25 +2574,21 @@ static int GetClosestRdmaNicId(int hipDeviceId)
 {  
   char hipPciBusId[64];
   hipError_t err = hipDeviceGetPCIBusId(hipPciBusId, sizeof(hipPciBusId), hipDeviceId);
-  if (err != hipSuccess) 
-  {
+  if (err != hipSuccess) {
     printf("Failed to get PCI Bus ID for HIP device %d: %s\n", hipDeviceId, hipGetErrorString(err));
     return -1;
   }
   int closestRdmaNicId = GetNearestPcieDeviceInTree(pcie_root, hipPciBusId, IbDeviceBusIds);
   // The following will only use distance between bus IDs 
   // to determine the closest NIC to GPU if the PCIe tree approach fails
-  if(closestRdmaNicId < 0)
-  {
+  if(closestRdmaNicId < 0) {
     printf("[Warn] falling back to PCIe bus ID distance to determine proximity\n");
     int minDistance = std::numeric_limits<int>::max();
-    for (int i = 0; i < IbDeviceBusIds.size(); ++i)
-    { 
+    for (int i = 0; i < IbDeviceBusIds.size(); ++i) {
       auto address = IbDeviceBusIds[i];
       if (address != "") {
         int distance = GetBusIdDistance(hipPciBusId, address);
-        if (distance < minDistance && distance >= 0)
-        {
+        if (distance < minDistance && distance >= 0) {
           minDistance = distance;
           closestRdmaNicId = i;
         }
@@ -2645,18 +2606,15 @@ static int GetClosestGpuDeviceId(int IbvDeviceId)
   if (address.empty()) return -1;      
   int closestDevice = -1;
   int minDistance = std::numeric_limits<int>::max();
-  for (int i = 0; i < GpuCount; ++i)
-  {
+  for (int i = 0; i < GpuCount; ++i) {
     char hipPciBusId[64];
     hipError_t err = hipDeviceGetPCIBusId(hipPciBusId, sizeof(hipPciBusId), i);
-    if (err != hipSuccess) 
-    {
+    if (err != hipSuccess) {
       printf("Failed to get PCI Bus ID for HIP device %d: %s\n", i, hipGetErrorString(err));
       return -1;
     }
     int distance = GetBusIdDistance(hipPciBusId, address);
-    if (distance < minDistance && distance >= 0)
-    {
+    if (distance < minDistance && distance >= 0) {
       minDistance = distance;
       closestDevice = i;
     }
@@ -2689,18 +2647,15 @@ static void PrintPCIeTree(PCIe_tree   const& node,
                           std::string const& prefix = "", 
                           bool               isLast = true)
 {
-  if(!node.address.empty())
-  {
+  if(!node.address.empty()) {
     printf("%s%s%s", prefix.c_str(), (isLast ? "└── " : "├── "), node.address.c_str());
-    if(!node.description.empty())
-    {
+    if(!node.description.empty()) {
       printf("(%s)", node.description.c_str());
     }
     printf("\n");
   }
   const auto& children = node.children;
-  for (auto it = children.begin(); it != children.end(); ++it)
-  {
+  for (auto it = children.begin(); it != children.end(); ++it) {
     PrintPCIeTree(*it, prefix + (isLast ? "    " : "│   "), std::next(it) == children.end());
   }
 }
@@ -2721,13 +2676,10 @@ static ErrResult CreateQP(struct ibv_pd *pd,
   attr.cap.max_recv_sge = 1;
   attr.qp_type = IBV_QPT_RC;
   qp = ibv_create_qp(pd, &attr);
-  if(qp == NULL)
-  {
-  return {ERR_FATAL, "Error while creating QP"};
-  }
-  else
-  {
-  return ERR_NONE;
+  if(qp == NULL) {
+    return {ERR_FATAL, "Error while creating QP"};
+  } else {
+    return ERR_NONE;
   }
 }
 
@@ -2750,8 +2702,7 @@ static ErrResult InitQP(struct ibv_qp* qp,
   
   if (ret != 0) {
     return {ERR_FATAL, "Error during QP Init. IB Verbs Error code: %d", ret};
-  }
-  else {
+  } else {
     return ERR_NONE;
   }
 }
@@ -2810,8 +2761,7 @@ static ErrResult TransitionQpToRtr(ibv_qp*         qp,
               IBV_QP_MIN_RNR_TIMER);
   if (ret != 0) {
     return {ERR_FATAL, "Error during QP RTR. IB Verbs Error code: %d", ret};
-  }
-  else {
+  } else {
     return ERR_NONE;
   }
 }
@@ -2836,8 +2786,7 @@ static ErrResult TransitionQpToRts(struct ibv_qp *qp)
             IBV_QP_MAX_QP_RD_ATOMIC);
   if (ret != 0) {
     return {ERR_FATAL, "Error during QP RTS. IB Verbs Error code: %d", ret};
-  }
-  else {
+  } else {
     return ERR_NONE;
   }
 }
@@ -3070,8 +3019,7 @@ static ErrResult SetGidIndex(struct ibv_context* context,
 
 static ErrResult InitDeviceList() 
 {
-  if (deviceList == NULL) 
-  {
+  if (deviceList == NULL) {
     IBV_PTR_CALL(deviceList, ibv_get_device_list, &RdmaNicCount);
   }
   return ERR_NONE;
@@ -3079,8 +3027,7 @@ static ErrResult InitDeviceList()
 
 static ErrResult GetNicCount(int& NicCount)
 {
-  if (deviceList == NULL && RdmaNicCount < 0)
-  {
+  if (deviceList == NULL && RdmaNicCount < 0) {
     InitDeviceList();
   }
   NicCount = RdmaNicCount;
@@ -3305,18 +3252,14 @@ static ErrResult TeardownRdma(TransferResources & resources)
   auto&& srcDeviceId = resources.srcNic;
   auto&& dstDeviceId = resources.dstNic;
   auto&& qpCount     = resources.qpCount;
-  if (sourceMr.size() > 0) 
-  {
-    for(auto mr : sourceMr) 
-    {
+  if (sourceMr.size() > 0) {
+    for(auto mr : sourceMr) {
       IBV_CALL(ibv_dereg_mr, mr.first);
     }
     sourceMr.clear();
   }
-  if (dstMr.size() > 0) 
-  {
-    for(auto mr : dstMr) 
-    {
+  if (dstMr.size() > 0) {
+    for(auto mr : dstMr) {
       IBV_CALL(ibv_dereg_mr, mr.first);
     }
     dstMr.clear();
@@ -3324,8 +3267,7 @@ static ErrResult TeardownRdma(TransferResources & resources)
   resources.receiveStatuses.clear();
   resources.messageSizes.clear();
   
-  if (senderQp) 
-  {
+  if (senderQp) {
     for (int i = 0; i < qpCount; ++i) {
       IBV_CALL(ibv_destroy_qp, senderQp[i]);
       senderQp[i] = nullptr;
@@ -3333,8 +3275,7 @@ static ErrResult TeardownRdma(TransferResources & resources)
     delete[] senderQp;
     senderQp = nullptr;
   }
-  if (receiverQp) 
-  {
+  if (receiverQp) {
     for (int i = 0; i < qpCount; ++i) {
       IBV_CALL(ibv_destroy_qp, receiverQp[i]);
       receiverQp[i] = nullptr;
