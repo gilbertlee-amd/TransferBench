@@ -97,10 +97,8 @@ static void PrintNicToGPUTopo(bool outputToCsv)
       auto closestGpus = TransferBench::GetClosestGpusToNic(i);
       std::string closestGpusStr;
       for (size_t j = 0; j < closestGpus.size(); ++j) {
+        if (j) closestGpusStr += ",";
         closestGpusStr += std::to_string(closestGpus[j]);
-        if (j < closestGpus.size() - 1) {
-          closestGpusStr += ",";
-        }
       }
 
       printf("%-12d | %-11s | %-11s | %-13s | %-11s\n",
