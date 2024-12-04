@@ -105,7 +105,7 @@ public:
   int roceVersion;                   // RoCE version number
   int ipAddressFamily;               // IP Address Famliy
   uint8_t ibPort;                    // NIC port number to be used
-  std::string closestNicStr;            // Holds the user-specified list of closest NICs
+  std::string closestNicStr;         // Holds the user-specified list of closest NICs
 
   // Developer features
   int gpuMaxHwQueues;                // Tracks GPU_MAX_HW_QUEUES environment variable

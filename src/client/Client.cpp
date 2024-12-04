@@ -239,7 +239,7 @@ void PrintResults(EnvVars const& ev, int const testNum,
             MemDevicesToStr(t.srcs).c_str(),
             ExeTypeName[exeType], exeIndex,
             exeSubIndexStr, subExecOrDstExec,
-            MemDevicesToStr(t.dsts).c_str());      
+            MemDevicesToStr(t.dsts).c_str());
 
       // Show per-iteration timing information
       if (ev.showIterations) {
