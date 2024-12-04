@@ -104,8 +104,7 @@ static void PrintNicToGPUTopo(bool outputToCsv)
       }
 
       printf("%-12d | %-11s | %-11s | %-13s | %-11s\n",
-             i,
-             nicDevice.c_str(),
+             i, nicDevice.c_str(),
              portActive ? "Yes" : "No",
              closestGpusStr.c_str(),
              devBusIds[i].c_str());
