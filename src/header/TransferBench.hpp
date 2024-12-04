@@ -2379,8 +2379,7 @@ static const PCIe_tree* getLcaBetweenNodes(const PCIe_tree* root, std::string no
       if (leftLCA) {
         rightLCA = lca;
         break;
-      }
-      else {
+      } else {
         leftLCA = lca;
       }
     }
