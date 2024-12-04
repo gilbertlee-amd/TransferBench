@@ -153,7 +153,7 @@ public:
     useSingleStream   = GetEnvVar("USE_SINGLE_STREAM"   , 1);
     validateDirect    = GetEnvVar("VALIDATE_DIRECT"     , 0);
     validateSource    = GetEnvVar("VALIDATE_SOURCE"     , 0);
-   
+
     ibGidIndex        = GetEnvVar("IB_GID_INDEX"        ,-1);
     ibPort            = GetEnvVar("IB_PORT_NUMBER"      , 1);
     roceVersion       = GetEnvVar("ROCE_VERSION"        , 2);
@@ -161,7 +161,7 @@ public:
     closestNicStr     = GetEnvVar("CLOSEST_NIC"         , "");
 
     gpuMaxHwQueues    = GetEnvVar("GPU_MAX_HW_QUEUES"   , 4);
-    
+
 
     // Check for fill pattern
     char* pattern = getenv("FILL_PATTERN");
@@ -514,13 +514,13 @@ public:
     cfg.rdma.roceVersion           = roceVersion;
     std::vector<int> closestNics;
     int numRdmaExec = GetNumExecutors(EXE_IBV);
-    if(closestNicStr != "") {      
+    if(closestNicStr != "") {
       std::stringstream ss(closestNicStr);
       std::string item;
       while (std::getline(ss, item, ',')) {
         try {
           int nic = std::stoi(item);
-          if (nic < 0) {        
+          if (nic < 0) {
             printf("[ERROR]: NIC index in user-specified list cannot be negative\n");
             exit(1);
           } else if(nic >= numRdmaExec) {

@@ -43,9 +43,9 @@ static int RemappedCpuIndex(int origIdx)
   return remappingCpu[origIdx];
 }
 
-static void PrintNicToGPUTopo(bool outputToCsv) 
+static void PrintNicToGPUTopo(bool outputToCsv)
 {
-#ifndef NO_IBV_EXEC    
+#ifndef NO_IBV_EXEC
     if (outputToCsv) {
       printf("Device Index,Device Name,Port Active,Closest GPU(s),PCIe Bus ID\n");
     }
@@ -56,7 +56,7 @@ static void PrintNicToGPUTopo(bool outputToCsv)
     std::vector<std::string> devBusIds;
     std::vector<std::string> devNames;
     std::vector<bool> devPortsActive;
-    int devCount; 
+    int devCount;
     struct ibv_device **deviceList = ibv_get_device_list(&devCount);
     if (deviceList && devCount > 0) {
       devBusIds.resize(devCount, "");
@@ -72,7 +72,7 @@ static void PrintNicToGPUTopo(bool outputToCsv)
               struct ibv_port_attr portAttr;
               if (ibv_query_port(ctx, port, &portAttr) == 0 && portAttr.state == IBV_PORT_ACTIVE) {
                 devPortsActive[i] = true;
-                break;              
+                break;
               }
             }
           }
@@ -84,7 +84,7 @@ static void PrintNicToGPUTopo(bool outputToCsv)
             std::size_t pos = pciPath.find_last_of('/');
             if (pos != std::string::npos) {
               std::string nicBusId = pciPath.substr(pos + 1);
-              devBusIds[i] = nicBusId;              
+              devBusIds[i] = nicBusId;
             }
           }
           ibv_close_device(ctx);
@@ -105,21 +105,21 @@ static void PrintNicToGPUTopo(bool outputToCsv)
           closestGpusStr += ",";
         }
       }
-     
+
       if (outputToCsv) {
-        printf("%d,%s,%s,%s,%s\n", 
-               i, 
-               nicDevice.c_str(), 
-               portActive ? "Yes" : "No", 
-               closestGpusStr.c_str(), 
+        printf("%d,%s,%s,%s,%s\n",
+               i,
+               nicDevice.c_str(),
+               portActive ? "Yes" : "No",
+               closestGpusStr.c_str(),
                devBusIds[i].c_str());
       }
       else {
-        printf("%-12d | %-11s | %-11s | %-13s | %-11s\n", 
-               i, 
-               nicDevice.c_str(), 
-               portActive ? "Yes" : "No", 
-               closestGpusStr.c_str(), 
+        printf("%-12d | %-11s | %-11s | %-13s | %-11s\n",
+               i,
+               nicDevice.c_str(),
+               portActive ? "Yes" : "No",
+               closestGpusStr.c_str(),
                devBusIds[i].c_str());
       }
     }
@@ -183,7 +183,7 @@ void DisplayTopology(bool outputToCsv)
   printf("\n");
 
   // Print out detected NIC topology
-  PrintNicToGPUTopo(outputToCsv);  
+  PrintNicToGPUTopo(outputToCsv);
 
   // Print out detected GPU topology
 #if defined(__NVCC__)
