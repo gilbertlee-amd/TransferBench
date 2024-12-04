@@ -313,7 +313,7 @@ public:
     printf(" USE_SINGLE_STREAM - Use a single stream per GPU GFX executor instead of stream per Transfer\n");
     printf(" VALIDATE_DIRECT   - Validate GPU destination memory directly instead of staging GPU memory on host\n");
     printf(" VALIDATE_SOURCE   - Validate GPU src memory immediately after preparation\n");
-    printf(" IB_GID_INDEX      - Required for RoCE NICs (default=3)\n");
+    printf(" IB_GID_INDEX      - Required for RoCE NICs (default=-1/auto)\n");
     printf(" IB_PORT_NUMBER    - RDMA port count for RDMA NIC (default=1)\n");
     printf(" IP_ADDRESS_FAMILY - IP address family (4=v4, 6=v6, default=v4)\n");
     printf(" ROCE_VERSION      - RoCE version (default=2)\n");
