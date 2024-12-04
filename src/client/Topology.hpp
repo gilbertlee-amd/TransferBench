@@ -94,7 +94,7 @@ static void PrintNicToGPUTopo(bool outputToCsv)
       std::string nicDevice = devNames[i];
       bool portActive = devPortsActive[i];
 
-      auto closestGpus = GetClosestGpusToNic(i);
+      auto closestGpus = TransferBench::GetClosestGpusToNic(i);
       std::string closestGpusStr;
       for (size_t j = 0; j < closestGpus.size(); ++j) {
         closestGpusStr += std::to_string(closestGpus[j]);

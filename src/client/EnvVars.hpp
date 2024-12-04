@@ -513,7 +513,7 @@ public:
     cfg.rdma.ipAddressFamily       = ipAddressFamily;
     cfg.rdma.roceVersion           = roceVersion;
     std::vector<int> closestNics;
-    int numRdmaExec = GetNumExecutors(EXE_NIC);
+    int numRdmaExec = TransferBench::GetNumExecutors(EXE_NIC);
     if(closestNicStr != "") {
       std::stringstream ss(closestNicStr);
       std::string item;
