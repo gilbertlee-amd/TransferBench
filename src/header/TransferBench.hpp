@@ -2434,13 +2434,7 @@ static int GetBusIdDistance(std::string const& pcieAddress1,
 {
   int bus1 = ExtractBusNumber(pcieAddress1);
   int bus2 = ExtractBusNumber(pcieAddress2);
-
-  if (bus1 == -1 || bus2 == -1) {
-    return -1; // Error case, invalid bus number
-  }
-
-  // Distance between two PCIe devices based on their bus numbers
-  return std::abs(bus1 - bus2);
+  return (bus1 == -1 || bus2 == -1)? -1 : std::abs(bus1 - bus2);
 }
 
 static int GetNearestPcieDeviceInTree(PCIe_tree                const& root,
