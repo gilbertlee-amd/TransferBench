@@ -513,6 +513,7 @@ public:
     cfg.rdma.ipAddressFamily       = ipAddressFamily;
     cfg.rdma.roceVersion           = roceVersion;
     std::vector<int> closestNics;
+    int numRdmaExec = GetNumExecutors(EXE_IBV);
     if(closestNicStr != "") {      
       std::stringstream ss(closestNicStr);
       std::string item;
@@ -520,7 +521,10 @@ public:
         try {
           int nic = std::stoi(item);
           if (nic < 0) {        
-            printf("[ERROR]: NIC index cannot be negative\n");
+            printf("[ERROR]: NIC index in user-specified list cannot be negative\n");
+            exit(1);
+          } else if(nic >= numRdmaExec) {
+            printf("[ERROR]: NIC index in user-specified list is out of bound. Available NICs: %d \n", numRdmaExec);
             exit(1);
           }
           closestNics.push_back(nic);
