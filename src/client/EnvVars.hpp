@@ -317,7 +317,7 @@ public:
     printf(" IB_PORT_NUMBER    - RDMA port count for RDMA NIC (default=1)\n");
     printf(" IP_ADDRESS_FAMILY - IP address family (4=v4, 6=v6, default=v4)\n");
     printf(" ROCE_VERSION      - RoCE version (default=2)\n");
-    printf(" CLOSEST_NIC       - Comma seperated list of per-GPU closest NIC (default=auto)\n");
+    printf(" CLOSEST_NIC       - Comma-separated list of per-GPU closest NIC (default=auto)\n");
   }
 
   void Print(std::string const& name, int32_t const value, const char* format, ...) const
