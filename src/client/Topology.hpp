@@ -46,11 +46,8 @@ static int RemappedCpuIndex(int origIdx)
 static void PrintNicToGPUTopo(bool outputToCsv)
 {
 #ifndef NO_IBV_EXEC
-    if (outputToCsv) {
-      printf("Device Index,Device Name,Port Active,Closest GPU(s),PCIe Bus ID\n");
-    }
-    else {
-      printf("Device Index | Device Name | Port Active | Closest GPU(s) | PCIe Bus ID\n");
+    printf("Device Index | Device Name | Port Active | Closest GPU(s) | PCIe Bus ID\n");
+    if(!outputToCsv) {
       printf("-------------+-------------+-------------+----------------+------------\n");
     }
     std::vector<std::string> devBusIds;
@@ -106,22 +103,13 @@ static void PrintNicToGPUTopo(bool outputToCsv)
         }
       }
 
-      if (outputToCsv) {
-        printf("%d,%s,%s,%s,%s\n",
-               i,
-               nicDevice.c_str(),
-               portActive ? "Yes" : "No",
-               closestGpusStr.c_str(),
-               devBusIds[i].c_str());
-      }
-      else {
-        printf("%-12d | %-11s | %-11s | %-13s | %-11s\n",
-               i,
-               nicDevice.c_str(),
-               portActive ? "Yes" : "No",
-               closestGpusStr.c_str(),
-               devBusIds[i].c_str());
-      }
+      printf("%-12d | %-11s | %-11s | %-13s | %-11s\n",
+             i,
+             nicDevice.c_str(),
+             portActive ? "Yes" : "No",
+             closestGpusStr.c_str(),
+             devBusIds[i].c_str());
+
     }
     printf("\n");
 #endif
