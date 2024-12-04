@@ -75,13 +75,13 @@ namespace TransferBench
     EXE_CPU          = 0,                       ///<  CPU executor              (subExecutor = CPU thread)
     EXE_GPU_GFX      = 1,                       ///<  GPU kernel-based executor (subExecutor = threadblock/CU)
     EXE_GPU_DMA      = 2,                       ///<  GPU SDMA executor         (subExecutor = not supported)
-    EXE_IBV          = 3,                       ///<  IBVerbs executor          (subExecutor = queue pair)
-    EXE_IBV_NEAREST  = 4                        ///<  IBVerbs nearest executor  (subExecutor = queue pair)
+    EXE_NIC          = 3,                       ///<  RDMA NIC executor         (subExecutor = queue pair)
+    EXE_NIC_NEAREST  = 4                        ///<  RDMA NIC nearest executor (subExecutor = queue pair)
   };
   char const ExeTypeStr[6] = "CGDIN";
   inline bool IsCpuExeType(ExeType e){ return e == EXE_CPU; }
   inline bool IsGpuExeType(ExeType e){ return e == EXE_GPU_GFX || e == EXE_GPU_DMA; }
-  inline bool IsRdmaExeType(ExeType e){ return e == EXE_IBV || e == EXE_IBV_NEAREST; }
+  inline bool IsRdmaExeType(ExeType e){ return e == EXE_NIC || e == EXE_NIC_NEAREST; }
 
   /**
    * A ExeDevice defines a specific Executor
@@ -1092,7 +1092,7 @@ namespace {
           }
         }
         break;
-      case EXE_IBV: case EXE_IBV_NEAREST:
+      case EXE_NIC: case EXE_NIC_NEAREST:
         // errors.push_back({ERR_FATAL, "Transfer %d: IBV executor currently not supported", i});
         break;
       }
@@ -3326,7 +3326,7 @@ static ErrResult TeardownRdma(TransferResources & resources)
     case EXE_GPU_GFX: return RunGpuExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
     case EXE_GPU_DMA: return RunDmaExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
 #ifndef NO_IBV_EXEC
-    case EXE_IBV: case EXE_IBV_NEAREST: return RunRdmaExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
+    case EXE_NIC: case EXE_NIC_NEAREST: return RunRdmaExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
 #endif
     default:          return {ERR_FATAL, "Unsupported executor (%d)", exeDevice.exeType};
     }
@@ -3700,7 +3700,7 @@ static ErrResult TeardownRdma(TransferResources & resources)
         ExeDevice exeDevice;
         ERR_CHECK(ParseExeType(dstExeStr, exeDevice, transfer.exeSubIndex));
         transfer.exeDstIndex = exeDevice.exeIndex;
-        if(transfer.exeDevice.exeType == EXE_IBV_NEAREST) {
+        if(transfer.exeDevice.exeType == EXE_NIC_NEAREST) {
           transfer.exeDevice.exeIndex = GetClosestNicToGpu(transfer.exeDevice.exeIndex);
           transfer.exeDstIndex        = GetClosestNicToGpu(transfer.exeDstIndex);
         }
@@ -3723,7 +3723,7 @@ static ErrResult TeardownRdma(TransferResources & resources)
       return numDetectedGpus;
     }
 #ifndef NO_IBV_EXEC
-    case EXE_IBV: case EXE_IBV_NEAREST:
+    case EXE_NIC: case EXE_NIC_NEAREST:
     {
       int numDetectedNics = 0;
       if (GetNicCount(numDetectedNics).errType != ERR_NONE) numDetectedNics = 0;

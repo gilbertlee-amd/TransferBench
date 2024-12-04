@@ -118,7 +118,7 @@ void DisplayTopology(bool outputToCsv)
 {
   int numCpus = TransferBench::GetNumExecutors(EXE_CPU);
   int numGpus = TransferBench::GetNumExecutors(EXE_GPU_GFX);
-  int numNics = TransferBench::GetNumExecutors(EXE_IBV);
+  int numNics = TransferBench::GetNumExecutors(EXE_NIC);
   char sep = (outputToCsv ? ',' : '|');
 
   if (outputToCsv) {

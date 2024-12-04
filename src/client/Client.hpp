@@ -30,7 +30,7 @@ THE SOFTWARE.
 
 size_t const DEFAULT_BYTES_PER_TRANSFER = (1<<26);
 
-char const ExeTypeName[5][4] = {"CPU", "GPU", "DMA", "IBV", "IBV"};
+char const ExeTypeName[5][4] = {"CPU", "GPU", "DMA", "NIC", "NIC"};
 
 // Display detected hardware
 void DisplayTopology(bool outputToCsv);
