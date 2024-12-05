@@ -505,16 +505,8 @@ namespace TransferBench
   } while (0)
 
 // Helper macros for calling RDMA functions and reporting errors
-#define IBV_CALL_RELEASE(__func__, ...)                                 \
-  do {                                                                  \
-    int error = __func__(__VA_ARGS__);                                  \
-    if (error != 0) {                                                   \
-      return {ERR_FATAL, "Encountered IbVerbs error (%d) in func (%s) " \
-              , error, #__func__};                                      \
-    }                                                                   \
-  } while (0)
-
-#define IBV_CALL_DEBUG(__func__, ...)                                   \
+#ifdef VERBS_DEBUG
+#define IBV_CALL(__func__, ...)                                         \
   do {                                                                  \
     int error = __func__(__VA_ARGS__);                                  \
     if (error != 0) {                                                   \
@@ -523,16 +515,7 @@ namespace TransferBench
     }                                                                   \
   } while (0)
 
-#define IBV_PTR_CALL_RELEASE(__ptr__, __func__, ...)                       \
-  do {                                                                     \
-    __ptr__ = __func__(__VA_ARGS__);                                       \
-    if (__ptr__ == nullptr) {                                              \
-      return {ERR_FATAL, "Encountered IbVerbs nullptr error in func (%s) " \
-              , #__func__};                                                \
-    }                                                                      \
-  } while (0)
-
-#define IBV_PTR_CALL_DEBUG(__ptr__, __func__, ...)                         \
+#define IBV_PTR_CALL(__ptr__, __func__, ...)                               \
   do {                                                                     \
     __ptr__ = __func__(__VA_ARGS__);                                       \
     if (__ptr__ == nullptr) {                                              \
@@ -540,13 +523,24 @@ namespace TransferBench
               "and function (%s)", __LINE__, #__func__};                   \
     }                                                                      \
   } while (0)
-
-#ifdef VERBS_DEBUG
-#define IBV_PTR_CALL  IBV_PTR_CALL_DEBUG
-#define IBV_CALL      IBV_CALL_DEBUG
 #else
-#define IBV_PTR_CALL  IBV_PTR_CALL_RELEASE
-#define IBV_CALL      IBV_CALL_RELEASE
+#define IBV_CALL(__func__, ...)                                         \
+  do {                                                                  \
+    int error = __func__(__VA_ARGS__);                                  \
+    if (error != 0) {                                                   \
+      return {ERR_FATAL, "Encountered IbVerbs error (%d) in func (%s) " \
+              , error, #__func__};                                      \
+    }                                                                   \
+  } while (0)
+
+#define IBV_PTR_CALL(__ptr__, __func__, ...)                               \
+  do {                                                                     \
+    __ptr__ = __func__(__VA_ARGS__);                                       \
+    if (__ptr__ == nullptr) {                                              \
+      return {ERR_FATAL, "Encountered IbVerbs nullptr error in func (%s) " \
+              , #__func__};                                                \
+    }                                                                      \
+  } while (0)
 #endif
 
 namespace TransferBench
