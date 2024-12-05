@@ -1371,12 +1371,12 @@ namespace {
         resource.srcNic    = exeDevice.exeIndex;
         resource.dstNic    = GetClosestNicToGpu(transfer.exeDstIndex);
       }
-      resource.qpCount     = transfer.numSubExecs;
-      exeDevice.exeType    = EXE_NIC;
+      resource.qpCount  = transfer.numSubExecs;
+      exeDevice.exeType = EXE_NIC;
     } else if(exeDevice.exeType == EXE_NIC) {
-      resource.srcNic    = exeDevice.exeIndex;
-      resource.dstNic    = transfer.exeDstIndex;
-      resource.qpCount     = transfer.numSubExecs;
+      resource.srcNic  = exeDevice.exeIndex;
+      resource.dstNic  = transfer.exeDstIndex;
+      resource.qpCount = transfer.numSubExecs;
     }
   }
 
