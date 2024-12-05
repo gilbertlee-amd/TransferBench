@@ -2347,8 +2347,12 @@ const unsigned int rdmaFlags = IBV_ACCESS_LOCAL_WRITE    |
   } while(0);
 
 const  uint64_t WR_ID = 1789;
+// struct RdmaStateHolder
+// {
+
+// }
 static ibv_device** deviceList = nullptr;
-static int RdmaNicCount        = -1;
+static int rdmaNicCount        = -1;
 static std::vector<std::string> IbDeviceBusIds;
 static std::vector<std::set<int>> NicToGpuMapper;
 static std::vector<int> GpuToNicMapper;
@@ -2542,21 +2546,28 @@ static int GetNearestPcieDeviceInTree(PCIe_tree                const& root,
   return index_of_closest;
 }
 
+static ErrResult InitDeviceList()
+{
+  if (deviceList == NULL) {
+    IBV_PTR_CALL(deviceList, ibv_get_device_list, &rdmaNicCount);
+  }
+  return ERR_NONE;
+}
+
 static void BuildPCIeTree()
 {
   INIT_ONCE(PcieTreeInit);
-  struct ibv_device **dev_list;
-  dev_list = ibv_get_device_list(&RdmaNicCount);
-  if (!dev_list) {
+  ErrResult error = InitDeviceList();
+  if(error.errType != ERR_NONE) {
     printf("Failed to get IB devices list.\n");
     return;
   }
-  IbDeviceBusIds.resize(RdmaNicCount, "");
-  NicToGpuMapper.resize(RdmaNicCount);
-  DeviceNames.resize(RdmaNicCount);
+  IbDeviceBusIds.resize(rdmaNicCount, "");
+  NicToGpuMapper.resize(rdmaNicCount);
+  DeviceNames.resize(rdmaNicCount);
 
-  for (int i = 0; i < RdmaNicCount; ++i) {
-    struct ibv_device *device = dev_list[i];
+  for (int i = 0; i < rdmaNicCount; ++i) {
+    struct ibv_device *device = deviceList[i];
     DeviceNames[i] = device->name;
     struct ibv_context *context = ibv_open_device(device);
     if (!context) {
@@ -2564,21 +2575,21 @@ static void BuildPCIeTree()
       continue;
     }
 
-    struct ibv_device_attr device_attr;
-    if (ibv_query_device(context, &device_attr)) {
+    struct ibv_device_attr deviceAttr;
+    if (ibv_query_device(context, &deviceAttr)) {
       printf("Failed to query device attributes for %s\n", device->name);
       ibv_close_device(context);
       continue;
     }
 
     bool portActive = false;
-    for (int port = 1; port <= device_attr.phys_port_cnt; ++port) {
-      struct ibv_port_attr port_attr;
-      if (ibv_query_port(context, port, &port_attr)) {
+    for (int port = 1; port <= deviceAttr.phys_port_cnt; ++port) {
+      struct ibv_port_attr portAttr;
+      if (ibv_query_port(context, port, &portAttr)) {
         printf("Failed to query port %d attributes for %s\n", port, device->name);
         continue;
       }
-      if (port_attr.state == IBV_PORT_ACTIVE) {
+      if (portAttr.state == IBV_PORT_ACTIVE) {
         portActive = true;
         break;
       }
@@ -2601,7 +2612,6 @@ static void BuildPCIeTree()
       }
     }
   }
-  ibv_free_device_list(dev_list);
   hipError_t err;
   err = (hipGetDeviceCount(&GpuCount));
   if (err != hipSuccess) {
@@ -3066,20 +3076,12 @@ static ErrResult SetGidIndex(struct ibv_context* context,
   return ERR_NONE;
 }
 
-static ErrResult InitDeviceList()
-{
-  if (deviceList == NULL) {
-    IBV_PTR_CALL(deviceList, ibv_get_device_list, &RdmaNicCount);
-  }
-  return ERR_NONE;
-}
-
 static ErrResult GetNicCount(int& NicCount)
 {
-  if (deviceList == NULL && RdmaNicCount < 0) {
-    InitDeviceList();
+  if (deviceList == NULL && rdmaNicCount < 0) {
+    ERR_CHECK(InitDeviceList());
   }
-  NicCount = RdmaNicCount;
+  NicCount = rdmaNicCount;
   return ERR_NONE;
 }
 
