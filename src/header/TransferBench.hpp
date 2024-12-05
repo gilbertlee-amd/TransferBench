@@ -391,13 +391,6 @@ namespace TransferBench
   std::vector<int> GetClosestGpusToNic(int nicIndex);
 
   /**
-   * Sets the closest NICs for each GPU
-   * @note This function only impacts the IBV/RDMA executor when it is available
-   * @param[in] closestNics Vector of NIC indices closest to each GPU
-   */
-  void SetClosestNics(const std::vector<int>& closestNics);
-
-  /**
    * Helper function to parse a line containing Transfers into a vector of Transfers
    *
    * @param[in]  str       String containing description of Transfers
@@ -3900,34 +3893,6 @@ static ErrResult TeardownRdma(TransferResources & resources)
     }
 #endif
     return closestGpus;
-  }
-
-  void SetClosestNics(const std::vector<int>& closestNics)
-  {
-#ifndef NO_IBV_EXEC
-    InitDeviceMappings();
-    if (closestNics.size() > 0) {
-      if(closestNics.size() < GpuCount) {
-        printf("[Error] Invalid number of entries in user-specified closest NICs. Specified: %zu. Available: %d.\n", closestNics.size(), GpuCount);
-        exit(1);
-      }
-      NicToGpuMapper.clear();
-      GpuToNicMapper.clear();
-      NicToGpuMapper.resize(RdmaNicCount);
-      GpuToNicMapper.resize(GpuCount, -1);
-      for(int i = 0; i < closestNics.size(); ++i) {
-        int nicId = closestNics[i];
-        if (nicId >= 0 && nicId < RdmaNicCount) {
-          GpuToNicMapper[i] = nicId;
-          assert(nicId < NicToGpuMapper.size());
-          NicToGpuMapper[nicId].insert(i);
-        } else {
-          printf("[Error] Invalid NIC ID in user-specified closest NICs: %d\n", nicId);
-          exit(1);
-        }
-      }
-    }
-#endif
   }
 
 // Undefine CUDA compatibility macros
