@@ -3056,8 +3056,7 @@ static ErrResult SetGidIndex(struct ibv_context* context,
   for (int gidIndexNext = 1; gidIndexNext < gidTblLen; ++gidIndexNext) {
     ErrResult err = UpdateGidIndex(context, portNum, userAddrFamily,
                                    prefix, 0, userRoceVersion, gidIndexNext,
-                                   gidIndex
-                                  );
+                                   gidIndex);
     if (err.errType != ERR_NONE) {
       return err;
     }
@@ -3128,36 +3127,19 @@ static ErrResult InitRdmaTransferResources(TransferResources &      resources,
   bool isRoce = srcRdmaResources->portAttr.link_layer == IBV_LINK_LAYER_ETHERNET;
   assert(srcRdmaResources->portAttr.link_layer == dstRdmaResources->portAttr.link_layer);
   if(isRoce) {
-    ERR_CHECK(SetGidIndex(srcRdmaResources->context,
-                          port,
+    ERR_CHECK(SetGidIndex(srcRdmaResources->context, port,
                           srcRdmaResources->portAttr.gid_tbl_len,
-                          roceVersion,
-                          ipAddrFamily,
-                          &srcGidIndex
-                         )
-             );
+                          roceVersion, ipAddrFamily, &srcGidIndex));
 
-    ERR_CHECK(SetGidIndex(dstRdmaResources->context,
-                          port,
+    ERR_CHECK(SetGidIndex(dstRdmaResources->context, port,
                           dstRdmaResources->portAttr.gid_tbl_len,
-                          roceVersion,
-                          ipAddrFamily,
-                          &dstGidIndex
-                         )
-              );
+                          roceVersion, ipAddrFamily, &dstGidIndex));
 
-    ERR_CHECK(SetIbvGid(srcRdmaResources->context,
-                        port,
-                        srcGidIndex,
-                        srcRdmaResources->gid
-                       )
-             );
+    ERR_CHECK(SetIbvGid(srcRdmaResources->context, port,
+                        srcGidIndex, srcRdmaResources->gid));
 
-    ERR_CHECK(SetIbvGid(dstRdmaResources->context,
-                        port,
-                        dstGidIndex,dstRdmaResources->gid
-                       )
-             );
+    ERR_CHECK(SetIbvGid(dstRdmaResources->context, port,
+                        dstGidIndex,dstRdmaResources->gid));
   }
 
   assert(senderQp == nullptr);
@@ -3167,52 +3149,26 @@ static ErrResult InitRdmaTransferResources(TransferResources &      resources,
   receiverQp = new ibv_qp* [qpCount];
   for(int i = 0; i < qpCount; ++i) {
     ERR_CHECK(CreateQP(srcRdmaResources->protectionDomain,
-                       srcRdmaResources->completionQueue,
-                       senderQp[i]
-                      )
-             );
+                       srcRdmaResources->completionQueue, senderQp[i]));
 
     ERR_CHECK(CreateQP(dstRdmaResources->protectionDomain,
-                       dstRdmaResources->completionQueue,
-                       receiverQp[i]
-                      )
-             );
+                       dstRdmaResources->completionQueue, receiverQp[i]));
 
-    ERR_CHECK(InitQP(senderQp[i],
-                     port,
-                     rdmaFlags
-                    )
-             );
+    ERR_CHECK(InitQP(senderQp[i], port, rdmaFlags));
 
-    ERR_CHECK(InitQP(receiverQp[i],
-                     port,
-                     rdmaFlags
-                    )
-             );
+    ERR_CHECK(InitQP(receiverQp[i], port, rdmaFlags));
 
-    ERR_CHECK(TransitionQpToRtr(senderQp[i],
-                                dstRdmaResources->portAttr.lid,
-                                receiverQp[i]->qp_num,
-                                dstRdmaResources->gid,
-                                dstGidIndex,
-                                port,
-                                isRoce,
-                                srcRdmaResources->portAttr.active_mtu
-                                )
-             );
+    ERR_CHECK(TransitionQpToRtr(senderQp[i], dstRdmaResources->portAttr.lid,
+                                receiverQp[i]->qp_num, dstRdmaResources->gid,
+                                dstGidIndex, port, isRoce,
+                                srcRdmaResources->portAttr.active_mtu));
 
     ERR_CHECK(TransitionQpToRts(senderQp[i]));
 
-    ERR_CHECK(TransitionQpToRtr(receiverQp[i],
-                                srcRdmaResources->portAttr.lid,
-                                senderQp[i]->qp_num,
-                                srcRdmaResources->gid,
-                                srcGidIndex,
-                                port,
-                                isRoce,
-                                dstRdmaResources->portAttr.active_mtu
-                                )
-              );
+    ERR_CHECK(TransitionQpToRtr(receiverQp[i], srcRdmaResources->portAttr.lid,
+                                senderQp[i]->qp_num, srcRdmaResources->gid,
+                                srcGidIndex, port, isRoce,
+                                dstRdmaResources->portAttr.active_mtu));
 
     ERR_CHECK(TransitionQpToRts(receiverQp[i]));
   }
@@ -3229,18 +3185,10 @@ static ErrResult RegisterRdmaMemoryTransfer(TransferResources &      resources,
   auto && dstRdmaResource = resources.rdmaResourceMapper[dstDeviceId];
   struct ibv_mr *src_mr;
   struct ibv_mr *dst_mr;
-  IBV_PTR_CALL(src_mr,
-               ibv_reg_mr,
-               srcRdmaResource->protectionDomain,
-               resources.srcMem[0],
-               resources.numBytes,
-               rdmaFlags);
-  IBV_PTR_CALL(dst_mr,
-               ibv_reg_mr,
-               dstRdmaResource->protectionDomain,
-               resources.dstMem[0],
-               resources.numBytes,
-               rdmaFlags);
+  IBV_PTR_CALL(src_mr, ibv_reg_mr, srcRdmaResource->protectionDomain, resources.srcMem[0],
+               resources.numBytes, rdmaFlags);
+  IBV_PTR_CALL(dst_mr, ibv_reg_mr, dstRdmaResource->protectionDomain, resources.dstMem[0],
+               resources.numBytes, rdmaFlags);
   resources.sourceMr.push_back(std::make_pair(src_mr, resources.srcMem[0]));
   resources.destinationMr.push_back(std::make_pair(dst_mr, resources.dstMem[0]));
   for(int i = 0; i < qpCount; ++i) {
