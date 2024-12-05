@@ -513,27 +513,19 @@ public:
     cfg.rdma.ipAddressFamily       = ipAddressFamily;
     cfg.rdma.roceVersion           = roceVersion;
     std::vector<int> closestNics;
-    int numRdmaExec = TransferBench::GetNumExecutors(EXE_NIC);
     if(closestNicStr != "") {
       std::stringstream ss(closestNicStr);
       std::string item;
       while (std::getline(ss, item, ',')) {
         try {
           int nic = std::stoi(item);
-          if (nic < 0) {
-            printf("[ERROR]: NIC index in user-specified list cannot be negative\n");
-            exit(1);
-          } else if(nic >= numRdmaExec) {
-            printf("[ERROR]: NIC index in user-specified list is out of bound. Available NICs: %d \n", numRdmaExec);
-            exit(1);
-          }
           closestNics.push_back(nic);
         } catch (const std::invalid_argument& e) {
-          printf("[ERROR] Invalid NIC index: %s\n", item.c_str());
+          printf("[ERROR] Invalid NIC index (%s) by user in %s\n", item.c_str(), closestNicStr.c_str());
           exit(1);
         }
       }
-      TransferBench::SetClosestNics(closestNics);
+      cfg.rdma.closestNics = closestNics;
     }
     return cfg;
   }

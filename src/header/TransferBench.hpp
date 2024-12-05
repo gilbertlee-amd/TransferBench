@@ -185,6 +185,7 @@ namespace TransferBench
     int roceVersion  = 2;                       ///< RoCE version (used for auto GID detection)
     int ipAddressFamily = 4;                    ///< 4=IPv4, 6=IPv6 (used for auto GID detection)
     uint8_t ibPort   = 1;                       ///< NIC port number to be used
+    vector<int> closestNics;                    ///< Per-GPU closest NIC
   };
 
   /**
@@ -268,6 +269,8 @@ namespace TransferBench
     // Only filled in if recordPerIteration = 1
     vector<double> perIterMsec;                 ///< Duration for each individual iteration
     vector<set<pair<int,int>>> perIterCUs;      ///< GFX-Executor only. XCC:CU used per iteration
+
+    int32_t           exeDstIndex;              ///< Final executor index (for RDMA executor only)
   };
 
   /**
@@ -915,6 +918,19 @@ namespace {
       }
     }
 
+    int numNics = GetNumExecutors(EXE_NIC);
+    auto& closestNics = cfg.rdma.closestNics;
+    for(auto&& nic : closestNics)
+      if (nic < 0 || nic >= numNics)
+        errors.push_back({ERR_FATAL, "NIC index (%d) in user-specified must be between 0 and %d",
+            nic, numNics - 1});
+
+    auto closetNicsSize = closestNics.size();
+    if(closetNicsSize > 0 && closetNicsSize < numGpus)
+      errors.push_back({ERR_FATAL, "Incomplete user-specified closest NIC list of size (%d). \
+          It must contain %d elements", closetNicsSize, numGpus});
+
+
     // NVIDIA specific
 #if defined(__NVCC__)
     if (cfg.data.validateDirect)
@@ -1092,8 +1108,17 @@ namespace {
           }
         }
         break;
-      case EXE_NIC: case EXE_NIC_NEAREST:
-        // errors.push_back({ERR_FATAL, "Transfer %d: IBV executor currently not supported", i});
+      case EXE_NIC_NEAREST:
+        if(cfg.rdma.closestNics.size() > 0) {
+          int srcIndex = t.exeDevice.exeIndex;
+          int dstIndex = t.exeDstIndex;
+          auto sz     = cfg.rdma.closestNics.size();
+          if(srcIndex < 0 || srcIndex >= sz)
+            errors.push_back({ERR_FATAL, "Transfer %d: for src NIC executor indexes an out-of-range GPU (%d)", i, srcIndex});
+          if(dstIndex < 0 || dstIndex >= sz)
+            errors.push_back({ERR_FATAL, "Transfer %d: for dst NIC executor indexes an out-of-range GPU (%d)", i, dstIndex});
+        }
+      case EXE_NIC:
         break;
       }
 
@@ -1330,6 +1355,31 @@ namespace {
     }
   }
 
+  // Update NIC ExeDevice and Transfer Resources
+  static void UpdateNicExeDeviceAndTxResource(ConfigOptions const& cfg,
+                                              Transfer      const& transfer,
+                                              TransferResources&     resource,
+                                              ExeDevice& exeDevice)
+  {
+    if(exeDevice.exeType == EXE_NIC_NEAREST) {
+      if(cfg.rdma.closestNics.size() > 0) {
+        exeDevice.exeIndex = cfg.rdma.closestNics[exeDevice.exeIndex];
+        resource.srcNic    = exeDevice.exeIndex;
+        resource.dstNic    = cfg.rdma.closestNics[transfer.exeDstIndex];
+      } else {
+        exeDevice.exeIndex = GetClosestNicToGpu(exeDevice.exeIndex);
+        resource.srcNic    = exeDevice.exeIndex;
+        resource.dstNic    = GetClosestNicToGpu(transfer.exeDstIndex);
+      }
+      resource.qpCount     = transfer.numSubExecs;
+      exeDevice.exeType    = EXE_NIC;
+    } else if(exeDevice.exeType == EXE_NIC) {
+      resource.srcNic    = exeDevice.exeIndex;
+      resource.dstNic    = transfer.exeDstIndex;
+      resource.qpCount     = transfer.numSubExecs;
+    }
+  }
+
   // Checks that destination buffers match expected values
   static ErrResult ValidateAllTransfers(ConfigOptions              const& cfg,
                                         vector<Transfer>           const& transfers,
@@ -1449,11 +1499,9 @@ namespace {
     return ERR_NONE;
   }
 #ifndef NO_IBV_EXEC
-static ErrResult InitRdmaTransferResources(Transfer          const& transfer,
-                                           TransferResources &      resources,
+static ErrResult InitRdmaTransferResources(TransferResources &      resources,
                                            RdmaOptions       const& rdmaOptions);
-static ErrResult RegisterRdmaMemoryTransfer(Transfer          const& transfer,
-                                            TransferResources &      resources,
+static ErrResult RegisterRdmaMemoryTransfer(TransferResources &      resources,
                                             int               & transferId);
 static ErrResult TransferRdma(TransferResources & resources,
                               int               const& transferIdx);
@@ -1597,16 +1645,11 @@ static ErrResult TeardownRdma(TransferResources & resources);
 #ifndef NO_IBV_EXEC
     for (auto& resources : exeInfo.resources) {
       Transfer const& t = transfers[resources.transferIdx];
-      ERR_CHECK(InitRdmaTransferResources(t,
-                                          resources,
-                                          cfg.rdma
-                                          ));
+      ERR_CHECK(InitRdmaTransferResources(resources, cfg.rdma));
       // Workaround until RDMA resource sharing
       // (i.e., multi-threading) is required
       int rdmaTransferId;
-      ERR_CHECK(RegisterRdmaMemoryTransfer(t,
-                                           resources,
-                                           rdmaTransferId));
+      ERR_CHECK(RegisterRdmaMemoryTransfer(resources, rdmaTransferId));
       assert(rdmaTransferId == 0);
     }
 #else
@@ -3050,10 +3093,8 @@ static ErrResult InitRdmaResources(int                   const& deviceID,
   return ERR_NONE;
 }
 
-static ErrResult InitRdmaTransferResources(Transfer          const& transfer,
-                                           TransferResources &      resources,
-                                           RdmaOptions       const& rdmaOptions
-                                          )
+static ErrResult InitRdmaTransferResources(TransferResources &      resources,
+                                           RdmaOptions       const& rdmaOptions)
 {
   InitDeviceList();
   auto && port            = rdmaOptions.ibPort;
@@ -3061,11 +3102,9 @@ static ErrResult InitRdmaTransferResources(Transfer          const& transfer,
   auto dstGidIndex        = rdmaOptions.ibGidIndex;
   auto && roceVersion     = rdmaOptions.roceVersion;
   auto && ipAddrFamily    = rdmaOptions.ipAddressFamily;
-  auto && qpCount         = transfer.numSubExecs;
-  auto && srcDeviceId     = transfer.exeDevice.exeIndex;
-  auto && dstDeviceId     = transfer.exeDstIndex;
-  resources.srcNic        = srcDeviceId;
-  resources.dstNic        = dstDeviceId;
+  auto && qpCount         = resources.qpCount;
+  auto && srcDeviceId     = resources.srcNic;
+  auto && dstDeviceId     = resources.dstNic;
   resources.qpCount       = qpCount;
   ERR_CHECK(InitRdmaResources(srcDeviceId, port, resources.rdmaResourceMapper));
   ERR_CHECK(InitRdmaResources(dstDeviceId, port, resources.rdmaResourceMapper));
@@ -3168,14 +3207,12 @@ static ErrResult InitRdmaTransferResources(Transfer          const& transfer,
   return ERR_NONE;
 }
 // using namespace TransferBench;
-static ErrResult RegisterRdmaMemoryTransfer(Transfer          const& transfer,
-                                            TransferResources &      resources,
-                                            int               & transferId
-                                           )
+static ErrResult RegisterRdmaMemoryTransfer(TransferResources &      resources,
+                                            int               & transferId)
 {
-  auto && srcDeviceId     = transfer.exeDevice.exeIndex;
-  auto && dstDeviceId     = transfer.exeDstIndex;
-  auto && qpCount         = transfer.numSubExecs;
+  auto && srcDeviceId     = resources.srcNic;
+  auto && dstDeviceId     = resources.dstNic;
+  auto && qpCount         = resources.qpCount;
   auto && srcRdmaResource = resources.rdmaResourceMapper[srcDeviceId];
   auto && dstRdmaResource = resources.rdmaResourceMapper[dstDeviceId];
   struct ibv_mr *src_mr;
@@ -3403,16 +3440,16 @@ static ErrResult TeardownRdma(TransferResources & resources)
     std::map<ExeDevice, ExeInfo> executorMap;
     for (int i = 0; i < transfers.size(); i++) {
       Transfer const& t = transfers[i];
-
-      ExeInfo& exeInfo = executorMap[t.exeDevice];
+      ExeDevice exeDevice = t.exeDevice;
+      TransferResources resource = {};
+      resource.transferIdx = i;
+      if(IsRdmaExeType(exeDevice.exeType))
+        UpdateNicExeDeviceAndTxResource(cfg, t, resource, exeDevice);
+      ExeInfo& exeInfo = executorMap[exeDevice];
       exeInfo.totalBytes    += t.numBytes;
       exeInfo.totalSubExecs += t.numSubExecs;
       exeInfo.useSubIndices |= (t.exeSubIndex != -1);
-
-      TransferResources resource = {};
-      resource.transferIdx = i;
       exeInfo.resources.push_back(resource);
-
       minNumSrcs  = std::min(minNumSrcs, (int)t.srcs.size());
       maxNumSrcs  = std::max(maxNumSrcs, (int)t.srcs.size());
       maxNumBytes = std::max(maxNumBytes, t.numBytes);
@@ -3564,6 +3601,7 @@ static ErrResult TeardownRdma(TransferResources & resources)
       for (auto const& resources : exeInfo.resources) {
         int const transferIdx = resources.transferIdx;
         TransferResult& tfrResult = results.tfrResults[transferIdx];
+        tfrResult.exeDstIndex     = resources.dstNic;
         exeResult.transferIdx.push_back(transferIdx);
         tfrResult.numBytes = resources.numBytes;
         tfrResult.avgDurationMsec = resources.totalDurationMsec / numTimedIterations;
@@ -3697,12 +3735,11 @@ static ErrResult TeardownRdma(TransferResources & resources)
 #ifdef NO_IBV_EXEC
         return {ERR_FATAL, "IB Verbs executor is requested but is not available"};
 #endif
-        ExeDevice exeDevice;
-        ERR_CHECK(ParseExeType(dstExeStr, exeDevice, transfer.exeSubIndex));
-        transfer.exeDstIndex = exeDevice.exeIndex;
-        if(transfer.exeDevice.exeType == EXE_NIC_NEAREST) {
-          transfer.exeDevice.exeIndex = GetClosestNicToGpu(transfer.exeDevice.exeIndex);
-          transfer.exeDstIndex        = GetClosestNicToGpu(transfer.exeDstIndex);
+        ExeDevice dstExeDevice;
+        ERR_CHECK(ParseExeType(dstExeStr, dstExeDevice, transfer.exeSubIndex));
+        transfer.exeDstIndex = dstExeDevice.exeIndex;
+        if(transfer.exeDevice.exeType != dstExeDevice.exeType) {
+          return {ERR_FATAL, "NIC executor src-dst pair type mismatch for Transfer %d", i + 1};
         }
       }
       transfers.push_back(transfer);
