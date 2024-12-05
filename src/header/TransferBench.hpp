@@ -2351,15 +2351,15 @@ const  uint64_t WR_ID = 1789;
 // {
 
 // }
-static ibv_device** deviceList = nullptr;
-static int rdmaNicCount        = -1;
-static std::vector<std::string> ibDeviceBusIds;
-static std::vector<std::set<int>> nicToGpuMapper;
-static std::vector<int> gpuToNicMapper;
-static std::vector<std::string> deviceNames;
-static bool deviceMappingInit  = false;
-static bool pcieTreeInit = false;
-static bool multiportFlag = false;
+static ibv_device** _deviceList = nullptr;
+static int _rdmaNicCount        = -1;
+static std::vector<std::string> _ibDeviceBusIds;
+static std::vector<std::set<int>> _nicToGpuMapper;
+static std::vector<int> _gpuToNicMapper;
+static std::vector<std::string> _deviceNames;
+static bool _deviceMappingInit  = false;
+static bool _pcieTreeInit = false;
+static bool _multiportFlag = false;
 
 class PCIe_tree
 {
@@ -2529,9 +2529,9 @@ static int GetNearestPcieDeviceInTree(PCIe_tree                const& root,
       for(int j = i + 1; j < matches.size(); ++j) {
         // Multiport NIC
         if(ExtractBusNumber(targetBusIds[matches[i]]) == ExtractBusNumber(targetBusIds[matches[j]])) {
-          index_of_closest = !multiportFlag? matches[i] : matches[j];
+          index_of_closest = !_multiportFlag? matches[i] : matches[j];
           // Workaround to distribute ports over GPUs
-          multiportFlag = !multiportFlag;
+          _multiportFlag = !_multiportFlag;
           return index_of_closest;
         }
       }
@@ -2547,27 +2547,27 @@ static int GetNearestPcieDeviceInTree(PCIe_tree                const& root,
 
 static ErrResult InitDeviceList()
 {
-  if (deviceList == NULL) {
-    IBV_PTR_CALL(deviceList, ibv_get_device_list, &rdmaNicCount);
+  if (_deviceList == NULL) {
+    IBV_PTR_CALL(_deviceList, ibv_get_device_list, &_rdmaNicCount);
   }
   return ERR_NONE;
 }
 
 static void BuildPCIeTree()
 {
-  INIT_ONCE(pcieTreeInit);
+  INIT_ONCE(_pcieTreeInit);
   ErrResult error = InitDeviceList();
   if(error.errType != ERR_NONE) {
     printf("Failed to get IB devices list.\n");
     return;
   }
-  ibDeviceBusIds.resize(rdmaNicCount, "");
-  nicToGpuMapper.resize(rdmaNicCount);
-  deviceNames.resize(rdmaNicCount);
+  _ibDeviceBusIds.resize(_rdmaNicCount, "");
+  _nicToGpuMapper.resize(_rdmaNicCount);
+  _deviceNames.resize(_rdmaNicCount);
 
-  for (int i = 0; i < rdmaNicCount; ++i) {
-    struct ibv_device *device = deviceList[i];
-    deviceNames[i] = device->name;
+  for (int i = 0; i < _rdmaNicCount; ++i) {
+    struct ibv_device *device = _deviceList[i];
+    _deviceNames[i] = device->name;
     struct ibv_context *context = ibv_open_device(device);
     if (!context) {
       printf("Failed to open device %s\n", device->name);
@@ -2606,14 +2606,14 @@ static void BuildPCIeTree()
       std::size_t pos = pciPath.find_last_of('/');
       if (pos != std::string::npos) {
         std::string nicBusId = pciPath.substr(pos + 1);
-        ibDeviceBusIds[i] = nicBusId;
-        InsertPCIePathToTree(&pcie_root, nicBusId, deviceNames[i]);
+        _ibDeviceBusIds[i] = nicBusId;
+        InsertPCIePathToTree(&pcie_root, nicBusId, _deviceNames[i]);
       }
     }
   }
 
   int gpuCount = GetNumExecutors(EXE_GPU_GFX);
-  gpuToNicMapper.resize(gpuCount, -1);
+  _gpuToNicMapper.resize(gpuCount, -1);
   for (int i = 0; i < gpuCount; ++i) {
     char hipPciBusId[64];
     hipError_t err = hipDeviceGetPCIBusId(hipPciBusId, sizeof(hipPciBusId), i);
@@ -2633,14 +2633,14 @@ static int GetClosestRdmaNicId(int hipDeviceId)
     printf("Failed to get PCI Bus ID for HIP device %d: %s\n", hipDeviceId, hipGetErrorString(err));
     return -1;
   }
-  int closestRdmaNicId = GetNearestPcieDeviceInTree(pcie_root, hipPciBusId, ibDeviceBusIds);
+  int closestRdmaNicId = GetNearestPcieDeviceInTree(pcie_root, hipPciBusId, _ibDeviceBusIds);
   // The following will only use distance between bus IDs
   // to determine the closest NIC to GPU if the PCIe tree approach fails
   if(closestRdmaNicId < 0) {
     printf("[Warn] falling back to PCIe bus ID distance to determine proximity\n");
     int minDistance = std::numeric_limits<int>::max();
-    for (int i = 0; i < ibDeviceBusIds.size(); ++i) {
-      auto address = ibDeviceBusIds[i];
+    for (int i = 0; i < _ibDeviceBusIds.size(); ++i) {
+      auto address = _ibDeviceBusIds[i];
       if (address != "") {
         int distance = GetBusIdDistance(hipPciBusId, address);
         if (distance < minDistance && distance >= 0) {
@@ -2656,8 +2656,8 @@ static int GetClosestRdmaNicId(int hipDeviceId)
 static int GetClosestGpuDeviceId(int IbvDeviceId)
 {
   BuildPCIeTree();
-  assert(IbvDeviceId < ibDeviceBusIds.size());
-  auto address = ibDeviceBusIds[IbvDeviceId];
+  assert(IbvDeviceId < _ibDeviceBusIds.size());
+  auto address = _ibDeviceBusIds[IbvDeviceId];
   if (address.empty()) return -1;
   int closestDevice = -1;
   int minDistance = std::numeric_limits<int>::max();
@@ -2680,15 +2680,15 @@ static int GetClosestGpuDeviceId(int IbvDeviceId)
 
 static void InitDeviceMappings()
 {
-  INIT_ONCE(deviceMappingInit);
+  INIT_ONCE(_deviceMappingInit);
   BuildPCIeTree();
   int gpuCount = GetNumExecutors(EXE_GPU_GFX);
   for (int i = 0; i < gpuCount; ++i) {
     int closestIbDevice = GetClosestRdmaNicId(i);
-    gpuToNicMapper[i] = closestIbDevice;
+    _gpuToNicMapper[i] = closestIbDevice;
     if(closestIbDevice >= 0) {
-      assert(closestIbDevice < nicToGpuMapper.size());
-      nicToGpuMapper[closestIbDevice].insert(i);
+      assert(closestIbDevice < _nicToGpuMapper.size());
+      _nicToGpuMapper[closestIbDevice].insert(i);
     }
   }
 }
@@ -2696,8 +2696,8 @@ static void InitDeviceMappings()
 static int GetClosestIbDevice(int hipDeviceId)
 {
   InitDeviceMappings();
-  assert(hipDeviceId < gpuToNicMapper.size());
-  return gpuToNicMapper[hipDeviceId];
+  assert(hipDeviceId < _gpuToNicMapper.size());
+  return _gpuToNicMapper[hipDeviceId];
 }
 
 static void PrintPCIeTree(PCIe_tree   const& node,
@@ -3075,10 +3075,10 @@ static ErrResult SetGidIndex(struct ibv_context* context,
 
 static ErrResult GetNicCount(int& NicCount)
 {
-  if (deviceList == NULL && rdmaNicCount < 0) {
+  if (_deviceList == NULL && _rdmaNicCount < 0) {
     ERR_CHECK(InitDeviceList());
   }
-  NicCount = rdmaNicCount;
+  NicCount = _rdmaNicCount;
   return ERR_NONE;
 }
 
@@ -3094,7 +3094,7 @@ static ErrResult InitRdmaResources(int                   const& deviceID,
   if (resourceMapper[deviceID] == nullptr) {
     resourceMapper[deviceID] = new NicResources();
     auto& rdma = resourceMapper[deviceID];
-    IBV_PTR_CALL(rdma->context, ibv_open_device, deviceList[deviceID]);
+    IBV_PTR_CALL(rdma->context, ibv_open_device, _deviceList[deviceID]);
     IBV_PTR_CALL(rdma->protectionDomain, ibv_alloc_pd, rdma->context);
     IBV_PTR_CALL(rdma->completionQueue, ibv_create_cq, rdma->context, 100, NULL, NULL, 0);
     IBV_CALL(ibv_query_port, rdma->context, port, &rdma->portAttr);
@@ -3837,11 +3837,11 @@ static ErrResult TeardownRdma(TransferResources & resources)
   {
 #ifndef NO_IBV_EXEC
     InitDeviceMappings();
-    if(gpuIndex >= gpuToNicMapper.size() || gpuIndex < 0) {
+    if(gpuIndex >= _gpuToNicMapper.size() || gpuIndex < 0) {
       printf("[Warning] GPU device index %d is out of range. \n", gpuIndex);
       return -1;
     }
-    return gpuToNicMapper[gpuIndex];
+    return _gpuToNicMapper[gpuIndex];
 #else
     return -1;
 #endif
@@ -3852,11 +3852,11 @@ static ErrResult TeardownRdma(TransferResources & resources)
     std::vector<int> closestGpus;
 #ifndef NO_IBV_EXEC
     InitDeviceMappings();
-    if(nicIndex >= nicToGpuMapper.size()) {
+    if(nicIndex >= _nicToGpuMapper.size()) {
       printf("[Warning] NIC index %d is out of range. No GPUs found.\n", nicIndex);
       return closestGpus;
     }
-    for (auto it = nicToGpuMapper[nicIndex].begin(); it != nicToGpuMapper[nicIndex].end(); ++it) {
+    for (auto it = _nicToGpuMapper[nicIndex].begin(); it != _nicToGpuMapper[nicIndex].end(); ++it) {
       closestGpus.push_back(*it);
     }
 #endif
