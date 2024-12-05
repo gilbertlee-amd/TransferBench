@@ -1275,8 +1275,9 @@ namespace {
     hsa_amd_sdma_engine_id_t   sdmaEngineId;      ///< DMA engine ID
 #endif
 
+// For IBV executor
 #ifndef NO_IBV_EXEC
-    vector<NicResources*> rdmaResourceMapper;    ///< Store resoruce sensitive RDMA fields
+    vector<NicResources*> rdmaResourceMapper;    ///< Store resource sensitive RDMA fields
     vector<pair<ibv_mr *, void*>> sourceMr;      ///< Memory region for the source buffer
     vector<pair<ibv_mr *, void*>> destinationMr; ///< Memory region for the destination buffer
     vector<bool> receiveStatuses;                ///< Keep track of send/recv statuses
