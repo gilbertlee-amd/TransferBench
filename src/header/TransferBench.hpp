@@ -2347,10 +2347,6 @@ const unsigned int rdmaFlags = IBV_ACCESS_LOCAL_WRITE    |
   } while(0);
 
 const  uint64_t WR_ID = 1789;
-// struct RdmaStateHolder
-// {
-
-// }
 static ibv_device** _deviceList = nullptr;
 static int _rdmaNicCount        = -1;
 static std::vector<std::string> _ibDeviceBusIds;
