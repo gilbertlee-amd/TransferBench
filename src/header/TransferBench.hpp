@@ -1511,8 +1511,9 @@ namespace {
     return ERR_NONE;
   }
 #ifndef NO_IBV_EXEC
-static ErrResult InitRdmaTransferResources(TransferResources &      resources,
-                                           RdmaOptions       const& rdmaOptions);
+static ErrResult InitRdmaTransferResources(RdmaOptions       const& rdmaOptions,
+                                           TransferResources &      resources);
+
 static ErrResult RegisterRdmaMemoryTransfer(TransferResources &      resources,
                                             int               & transferId);
 static ErrResult TransferRdma(TransferResources & resources,
@@ -1657,7 +1658,7 @@ static ErrResult TeardownRdma(TransferResources & resources);
 #ifndef NO_IBV_EXEC
     for (auto& resources : exeInfo.resources) {
       Transfer const& t = transfers[resources.transferIdx];
-      ERR_CHECK(InitRdmaTransferResources(resources, cfg.rdma));
+      ERR_CHECK(InitRdmaTransferResources(cfg.rdma, resources));
       // Workaround until RDMA resource sharing
       // (i.e., multi-threading) is required
       int rdmaTransferId;
@@ -3104,8 +3105,8 @@ static ErrResult InitRdmaResources(int                   const& deviceID,
   return ERR_NONE;
 }
 
-static ErrResult InitRdmaTransferResources(TransferResources &      resources,
-                                           RdmaOptions       const& rdmaOptions)
+static ErrResult InitRdmaTransferResources(RdmaOptions       const& rdmaOptions,
+                                           TransferResources&       resources)
 {
   InitDeviceList();
   auto && port            = rdmaOptions.ibPort;
@@ -3175,7 +3176,7 @@ static ErrResult InitRdmaTransferResources(TransferResources &      resources,
   return ERR_NONE;
 }
 // using namespace TransferBench;
-static ErrResult RegisterRdmaMemoryTransfer(TransferResources &      resources,
+static ErrResult RegisterRdmaMemoryTransfer(TransferResources & resources,
                                             int               & transferId)
 {
   auto && srcDeviceId     = resources.srcNic;
