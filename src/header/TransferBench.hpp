@@ -921,7 +921,7 @@ namespace {
     auto closetNicsSize = closestNics.size();
     if(closetNicsSize > 0 && closetNicsSize < numGpus)
       errors.push_back({ERR_FATAL, "User-specified closest NIC list must contain %d elements",
-            closetNicsSize, numGpus});
+            numGpus});
 
 
     // NVIDIA specific
