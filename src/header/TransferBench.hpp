@@ -2715,8 +2715,7 @@ static void PrintPCIeTree(PCIe_tree   const& node,
 
 static ErrResult CreateQP(struct ibv_pd *pd,
                           struct ibv_cq *cq,
-                          struct ibv_qp *& qp
-                        )
+                          struct ibv_qp *& qp)
 {
 
   struct ibv_qp_init_attr attr = {};
@@ -2763,8 +2762,7 @@ static ErrResult InitQP(struct ibv_qp* qp,
 static ErrResult SetIbvGid(ibv_context* const&  ctx,
                            uint8_t      const&  portNum,
                            int          const&  gidIndex,
-                           ibv_gid&             gid
-                          )
+                           ibv_gid&             gid)
 {
   IBV_CALL(ibv_query_gid, ctx, portNum, gidIndex, &gid);
   return ERR_NONE;
@@ -2777,8 +2775,7 @@ static ErrResult TransitionQpToRtr(ibv_qp*         qp,
                                    uint8_t  const& gidIndex,
                                    uint8_t  const& port,
                                    bool     const& isRoCE,
-                                   ibv_mtu  const& mtu
-                                  )
+                                   ibv_mtu  const& mtu)
 {
   struct ibv_qp_attr attr = {};
   memset(&attr, 0, sizeof(struct ibv_qp_attr));
@@ -2846,8 +2843,7 @@ static ErrResult TransitionQpToRts(struct ibv_qp *qp)
 
 static ErrResult  PollIbvCQ(struct ibv_cq*     cq,
                             int                transferIdx,
-                            std::vector<bool>& sendRecvStat
-                           )
+                            std::vector<bool>& sendRecvStat)
 {
   int nc = 0;
   struct ibv_wc wc;
@@ -2922,8 +2918,7 @@ static sa_family_t GetGidAddressFamily(union ibv_gid* gid)
 static bool MatchGidAddressFamily(sa_family_t const& af,
                                   void*              prefix,
                                   int                prefixlen,
-                                  union ibv_gid*     gid
-                                 )
+                                  union ibv_gid*     gid)
 {
   struct in_addr *base = NULL;
   struct in6_addr *base6 = NULL;
@@ -2967,8 +2962,7 @@ static bool MatchGidAddressFamily(sa_family_t const& af,
 static ErrResult GetRoceVersionNumber(const char* deviceName,
                                       int const&  portNum,
                                       int const&  gidIndex,
-                                      int*        version
-                                     )
+                                      int*        version)
   {
   char gidRoceVerStr[16] = { 0 };
   char roceTypePath[PATH_MAX] = { 0 };
@@ -3007,8 +3001,7 @@ static ErrResult UpdateGidIndex(struct ibv_context* const& context,
                                 int const&                 prefixlen,
                                 int const&                 roceVer,
                                 int const&                 gidIndexCandidate,
-                                int*&                      gidIndex
-                                )
+                                int*&                      gidIndex)
 {
   union ibv_gid gid, gidCandidate;
   IBV_CALL(ibv_query_gid, context, portNum, *gidIndex, &gid);
@@ -3044,8 +3037,7 @@ static ErrResult SetGidIndex(struct ibv_context* context,
                              int const&          gidTblLen,
                              int const&          roceVersion,
                              int const&          ipAddressFamily,
-                             int*                gidIndex
-                            )
+                             int*                gidIndex)
 {
   if (*gidIndex >= 0) {
     return ERR_NONE;
@@ -3080,8 +3072,7 @@ static ErrResult GetNicCount(int& NicCount)
 
 static ErrResult InitRdmaResources(int                   const& deviceID,
                                    uint8_t               const& port,
-                                   vector<NicResources*> &      resourceMapper
-                                   )
+                                   vector<NicResources*> &      resourceMapper)
 {
   if (resourceMapper.size() <= deviceID) {
     resourceMapper.resize(deviceID + 1);
@@ -3171,7 +3162,7 @@ static ErrResult InitRdmaTransferResources(RdmaOptions       const& rdmaOptions,
   }
   return ERR_NONE;
 }
-// using namespace TransferBench;
+
 static ErrResult RegisterRdmaMemoryTransfer(TransferResources & resources,
                                             int               & transferId)
 {
