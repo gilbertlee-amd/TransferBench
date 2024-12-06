@@ -939,7 +939,7 @@ namespace {
 
     auto closetNicsSize = closestNics.size();
     if(closetNicsSize > 0 && closetNicsSize < numGpus)
-      errors.push_back({ERR_FATAL, "User-specified closest NIC list must contain %d elements",
+      errors.push_back({ERR_FATAL, "User-specified closest NIC list must match GPU count of %d",
             numGpus});
 
 
@@ -1314,6 +1314,984 @@ namespace {
     vector<hipEvent_t>         stopEvents;        ///< HIP stop timing event
   };
 
+// IB Verbs-related functions
+//========================================================================================
+#ifndef NO_IBV_EXEC
+#define MAX_SEND_WR_PER_QP 12
+#define MAX_RECV_WR_PER_QP 12
+const unsigned int rdmaFlags = IBV_ACCESS_LOCAL_WRITE    |
+                               IBV_ACCESS_REMOTE_READ    |
+                               IBV_ACCESS_REMOTE_WRITE   |
+                               IBV_ACCESS_REMOTE_ATOMIC;
+#define IB_PSN  0
+#define INIT_ONCE(flag)\
+  do {                 \
+  if(flag) return;     \
+  else flag = true;    \
+  } while(0);
+
+const  uint64_t WR_ID = 1789;
+static ibv_device** _deviceList = nullptr;
+static int _rdmaNicCount        = -1;
+static std::vector<std::string> _ibDeviceBusIds;
+static std::vector<std::set<int>> _nicToGpuMapper;
+static std::vector<int> _gpuToNicMapper;
+static std::vector<std::string> _deviceNames;
+static bool _deviceMappingInit  = false;
+static bool _pcieTreeInit = false;
+static bool _multiportFlag = false;
+
+class PCIe_tree
+{
+public:
+  std::set<PCIe_tree> children;
+  std::string address;
+  std::string description;
+
+  // Constructor
+  PCIe_tree(const std::string& addr) : address(addr) {}
+
+    // Constructor
+  PCIe_tree(const std::string& addr, const std::string& desc)
+           :address(addr), description(desc) {}
+
+  // Default constructor
+  PCIe_tree() : address(""), description("") {}
+
+  // Comparison operator for std::set
+  bool operator<(const PCIe_tree& other) const {
+    return address < other.address;
+  }
+
+  // Function to find a node by address
+  const PCIe_tree* find(const std::string& addr) const {
+    if (address == addr) {
+      return this;
+    }
+    for (const auto& child : children) {
+      const PCIe_tree* result = child.find(addr);
+      if (result) {
+        return result;
+      }
+    }
+    return nullptr;
+  }
+};
+
+static PCIe_tree pcie_root;
+
+static void InsertPCIePathToTree(PCIe_tree* root, const std::string& pcieAddress, const std::string& description)
+{
+  std::filesystem::path devicePath = "/sys/bus/pci/devices/" + pcieAddress;
+  if (!std::filesystem::exists(devicePath)) {
+    printf("[ERROR] Device path %s does not exist\n", devicePath.c_str());
+    return;
+  }
+  std::string canonicalPath = std::filesystem::canonical(devicePath).string();
+  std::istringstream iss(canonicalPath);
+  std::string token;
+  PCIe_tree* currentNode = root;
+
+  while (std::getline(iss, token, '/')) {
+    std::string address = token;
+    auto it = currentNode->children.find(PCIe_tree(address));
+    if (it == currentNode->children.end()) {
+      currentNode->children.insert(PCIe_tree(address));
+      it = currentNode->children.find(PCIe_tree(address));
+    }
+    currentNode = const_cast<PCIe_tree*>(&(*it));
+  }
+  currentNode->description = description;
+}
+
+static const PCIe_tree* getLcaBetweenNodes(const PCIe_tree* root, std::string node1, std::string node2)
+{
+  if (!root || root->address == node1 || root->address == node2) {
+    return root;
+  }
+
+  const PCIe_tree* leftLCA = nullptr;
+  const PCIe_tree* rightLCA = nullptr;
+
+  for (const auto& child : root->children) {
+    const PCIe_tree* lca = getLcaBetweenNodes(&child, node1, node2);
+    if (lca) {
+      if (leftLCA) {
+        rightLCA = lca;
+        break;
+      } else {
+        leftLCA = lca;
+      }
+    }
+  }
+
+  if (leftLCA && rightLCA) {
+    return root;
+  }
+
+  return leftLCA ? leftLCA : rightLCA;
+}
+
+static int GetLcaDepth(std::string      const& targetBusID,
+                       const PCIe_tree* const& node,
+                       int                     depth = 0)
+{
+  if (!node) {
+    return -1;
+  }
+  if (targetBusID == node->address) {
+    return depth;
+  }
+  for (auto&& child : node->children) {
+    int distance = GetLcaDepth(targetBusID, &child, depth + 1);
+    if (distance != -1) {
+      return distance;
+    }
+  }
+  return -1;
+}
+
+// Function to extract the bus number from a PCIe address (domain:bus:device.function)
+static int ExtractBusNumber(std::string const& pcieAddress)
+{
+  int domain, bus, device, function;
+  char delimiter;
+
+  std::istringstream iss(pcieAddress);
+  iss >> std::hex >> domain >> delimiter >> bus >> delimiter >> device >> delimiter >> function;
+
+  if (iss.fail()) {
+    printf("Invalid PCIe address format: %s\n", pcieAddress.c_str());
+    return -1; // Invalid bus number
+  }
+
+  return bus;
+}
+
+// Function to compute the distance between two bus IDs
+static int GetBusIdDistance(std::string const& pcieAddress1,
+                            std::string const& pcieAddress2)
+{
+  int bus1 = ExtractBusNumber(pcieAddress1);
+  int bus2 = ExtractBusNumber(pcieAddress2);
+  return (bus1 < 0 || bus2 < 0)? -1 : std::abs(bus1 - bus2);
+}
+
+static int GetNearestPcieDeviceInTree(PCIe_tree                const& root,
+                                      std::string              const& busID,
+                                      std::vector<std::string> const& targetBusIds)
+{
+  int max_depth = -1;
+  int index_of_closest = -1;
+  std::vector <int> matches;
+  for (const auto& targetBusID : targetBusIds) {
+    if (targetBusID.empty()) continue;
+    const PCIe_tree* lca = getLcaBetweenNodes(&root, busID, targetBusID);
+    if (lca) {
+      int depth = GetLcaDepth(lca->address, &pcie_root);
+      if (depth > max_depth) {
+        max_depth = depth;
+        index_of_closest = &targetBusID - &targetBusIds[0];
+        matches.clear(); // found a new max depth
+        matches.push_back(index_of_closest);
+      } else if(depth == max_depth && depth >= 0) {
+        matches.push_back(&targetBusID - &targetBusIds[0]);
+      }
+    }
+  }
+  // 1. When more than one LCA match is found, opt for the one with the smallest
+  // bus id difference
+  // 2. Also cover when two NICs have the same busIds which indicates a dualport case
+  // (only two ports supported)
+  if(matches.size() > 1) {
+    int minDistance = std::numeric_limits<int>::max();
+    for (int i = 0; i < matches.size(); ++i) {
+      for(int j = i + 1; j < matches.size(); ++j) {
+        // Multiport NIC
+        if(ExtractBusNumber(targetBusIds[matches[i]]) == ExtractBusNumber(targetBusIds[matches[j]])) {
+          index_of_closest = !_multiportFlag? matches[i] : matches[j];
+          // Workaround to distribute ports over GPUs
+          _multiportFlag = !_multiportFlag;
+          return index_of_closest;
+        }
+      }
+      int distance = GetBusIdDistance(busID, targetBusIds[matches[i]]);
+      if (distance < minDistance) {
+        minDistance = distance;
+        index_of_closest = matches[i];
+      }
+    }
+  }
+  return index_of_closest;
+}
+
+static ErrResult InitDeviceList()
+{
+  if (_deviceList == NULL) {
+    IBV_PTR_CALL(_deviceList, ibv_get_device_list, &_rdmaNicCount);
+  }
+  return ERR_NONE;
+}
+
+static void BuildPCIeTree()
+{
+  INIT_ONCE(_pcieTreeInit);
+  ErrResult error = InitDeviceList();
+  if(error.errType != ERR_NONE) {
+    printf("Failed to get IB devices list.\n");
+    return;
+  }
+  _ibDeviceBusIds.resize(_rdmaNicCount, "");
+  _nicToGpuMapper.resize(_rdmaNicCount);
+  _deviceNames.resize(_rdmaNicCount);
+
+  for (int i = 0; i < _rdmaNicCount; ++i) {
+    struct ibv_device *device = _deviceList[i];
+    _deviceNames[i] = device->name;
+    struct ibv_context *context = ibv_open_device(device);
+    if (!context) {
+      printf("Failed to open device %s\n", device->name);
+      continue;
+    }
+
+    struct ibv_device_attr deviceAttr;
+    if (ibv_query_device(context, &deviceAttr)) {
+      printf("Failed to query device attributes for %s\n", device->name);
+      ibv_close_device(context);
+      continue;
+    }
+
+    bool portActive = false;
+    for (int port = 1; port <= deviceAttr.phys_port_cnt; ++port) {
+      struct ibv_port_attr portAttr;
+      if (ibv_query_port(context, port, &portAttr)) {
+        printf("Failed to query port %d attributes for %s\n", port, device->name);
+        continue;
+      }
+      if (portAttr.state == IBV_PORT_ACTIVE) {
+        portActive = true;
+        break;
+      }
+    }
+
+    ibv_close_device(context);
+
+    if (!portActive) {
+      continue;
+    }
+
+    std::string device_path(device->dev_path);
+    if (std::filesystem::exists(device_path)) {
+      std::string pciPath = std::filesystem::canonical(device_path + "/device").string();
+      std::size_t pos = pciPath.find_last_of('/');
+      if (pos != std::string::npos) {
+        std::string nicBusId = pciPath.substr(pos + 1);
+        _ibDeviceBusIds[i] = nicBusId;
+        InsertPCIePathToTree(&pcie_root, nicBusId, _deviceNames[i]);
+      }
+    }
+  }
+
+  int gpuCount = GetNumExecutors(EXE_GPU_GFX);
+  _gpuToNicMapper.resize(gpuCount, -1);
+  for (int i = 0; i < gpuCount; ++i) {
+    char hipPciBusId[64];
+    hipError_t err = hipDeviceGetPCIBusId(hipPciBusId, sizeof(hipPciBusId), i);
+    if (err != hipSuccess) {
+      printf("Failed to get PCI Bus ID for HIP device %d: %s\n", i, hipGetErrorString(err));
+      return;
+    }
+    InsertPCIePathToTree(&pcie_root, hipPciBusId, "GPU " + std::to_string(i));
+  }
+}
+
+static int GetClosestRdmaNicId(int hipDeviceId)
+{
+  char hipPciBusId[64];
+  hipError_t err = hipDeviceGetPCIBusId(hipPciBusId, sizeof(hipPciBusId), hipDeviceId);
+  if (err != hipSuccess) {
+    printf("Failed to get PCI Bus ID for HIP device %d: %s\n", hipDeviceId, hipGetErrorString(err));
+    return -1;
+  }
+  int closestRdmaNicId = GetNearestPcieDeviceInTree(pcie_root, hipPciBusId, _ibDeviceBusIds);
+  // The following will only use distance between bus IDs
+  // to determine the closest NIC to GPU if the PCIe tree approach fails
+  if(closestRdmaNicId < 0) {
+    printf("[Warn] falling back to PCIe bus ID distance to determine proximity\n");
+    int minDistance = std::numeric_limits<int>::max();
+    for (int i = 0; i < _ibDeviceBusIds.size(); ++i) {
+      auto address = _ibDeviceBusIds[i];
+      if (address != "") {
+        int distance = GetBusIdDistance(hipPciBusId, address);
+        if (distance < minDistance && distance >= 0) {
+          minDistance = distance;
+          closestRdmaNicId = i;
+        }
+      }
+    }
+  }
+  return closestRdmaNicId;
+}
+
+static int GetClosestGpuDeviceId(int IbvDeviceId)
+{
+  BuildPCIeTree();
+  assert(IbvDeviceId < _ibDeviceBusIds.size());
+  auto address = _ibDeviceBusIds[IbvDeviceId];
+  if (address.empty()) return -1;
+  int closestDevice = -1;
+  int minDistance = std::numeric_limits<int>::max();
+  int gpuCount = GetNumExecutors(EXE_GPU_GFX);
+  for (int i = 0; i < gpuCount; ++i) {
+    char hipPciBusId[64];
+    hipError_t err = hipDeviceGetPCIBusId(hipPciBusId, sizeof(hipPciBusId), i);
+    if (err != hipSuccess) {
+      printf("Failed to get PCI Bus ID for HIP device %d: %s\n", i, hipGetErrorString(err));
+      return -1;
+    }
+    int distance = GetBusIdDistance(hipPciBusId, address);
+    if (distance < minDistance && distance >= 0) {
+      minDistance = distance;
+      closestDevice = i;
+    }
+  }
+  return closestDevice;
+}
+
+static void InitDeviceMappings()
+{
+  INIT_ONCE(_deviceMappingInit);
+  BuildPCIeTree();
+  int gpuCount = GetNumExecutors(EXE_GPU_GFX);
+  for (int i = 0; i < gpuCount; ++i) {
+    int closestIbDevice = GetClosestRdmaNicId(i);
+    _gpuToNicMapper[i] = closestIbDevice;
+    if(closestIbDevice >= 0) {
+      assert(closestIbDevice < _nicToGpuMapper.size());
+      _nicToGpuMapper[closestIbDevice].insert(i);
+    }
+  }
+}
+
+static int GetClosestIbDevice(int hipDeviceId)
+{
+  InitDeviceMappings();
+  assert(hipDeviceId < _gpuToNicMapper.size());
+  return _gpuToNicMapper[hipDeviceId];
+}
+
+static void PrintPCIeTree(PCIe_tree   const& node,
+                          std::string const& prefix = "",
+                          bool               isLast = true)
+{
+  if(!node.address.empty()) {
+    printf("%s%s%s", prefix.c_str(), (isLast ? "└── " : "├── "), node.address.c_str());
+    if(!node.description.empty()) {
+      printf("(%s)", node.description.c_str());
+    }
+    printf("\n");
+  }
+  const auto& children = node.children;
+  for (auto it = children.begin(); it != children.end(); ++it) {
+    PrintPCIeTree(*it, prefix + (isLast ? "    " : "│   "), std::next(it) == children.end());
+  }
+}
+
+static ErrResult CreateQP(struct ibv_pd *pd,
+                          struct ibv_cq *cq,
+                          struct ibv_qp *& qp
+                        )
+{
+
+  struct ibv_qp_init_attr attr = {};
+  memset(&attr, 0, sizeof(struct ibv_qp_init_attr));
+  attr.send_cq = cq;
+  attr.recv_cq = cq;
+  attr.cap.max_send_wr  = MAX_SEND_WR_PER_QP;
+  attr.cap.max_recv_wr  = MAX_RECV_WR_PER_QP;
+  attr.cap.max_send_sge = 1;
+  attr.cap.max_recv_sge = 1;
+  attr.qp_type = IBV_QPT_RC;
+  qp = ibv_create_qp(pd, &attr);
+  if(qp == NULL) {
+    return {ERR_FATAL, "Error while creating QP"};
+  } else {
+    return ERR_NONE;
+  }
+}
+
+static ErrResult InitQP(struct ibv_qp* qp,
+                        uint8_t        port,
+                        unsigned       flags)
+{
+  struct ibv_qp_attr attr = {};        // Initialize the QP attributes structure to zero
+  memset(&attr, 0, sizeof(struct ibv_qp_attr));
+  attr.qp_state   = IBV_QPS_INIT;      // Set the QP state to INIT
+  attr.pkey_index = 0;                 // Set the partition key index to 0
+  attr.port_num   = port;              // Set the port number to the defined IB_PORT
+  attr.qp_access_flags = flags;        // Set the QP access flags to the provided flags
+
+  int ret = ibv_modify_qp(qp, &attr,
+           IBV_QP_STATE      |      // Modify the QP state
+           IBV_QP_PKEY_INDEX |      // Modify the partition key index
+           IBV_QP_PORT       |      // Modify the port number
+           IBV_QP_ACCESS_FLAGS);    // Modify the access flags
+
+  if (ret != 0) {
+    return {ERR_FATAL, "Error during QP Init. IB Verbs Error code: %d", ret};
+  } else {
+    return ERR_NONE;
+  }
+}
+
+static ErrResult SetIbvGid(ibv_context* const&  ctx,
+                           uint8_t      const&  portNum,
+                           int          const&  gidIndex,
+                           ibv_gid&             gid
+                          )
+{
+  IBV_CALL(ibv_query_gid, ctx, portNum, gidIndex, &gid);
+  return ERR_NONE;
+}
+
+static ErrResult TransitionQpToRtr(ibv_qp*         qp,
+                                   uint16_t const& dlid,
+                                   uint32_t const& dqpn,
+                                   ibv_gid  const& gid,
+                                   uint8_t  const& gidIndex,
+                                   uint8_t  const& port,
+                                   bool     const& isRoCE,
+                                   ibv_mtu  const& mtu
+                                  )
+{
+  struct ibv_qp_attr attr = {};
+  memset(&attr, 0, sizeof(struct ibv_qp_attr));
+  attr.qp_state       = IBV_QPS_RTR;
+  attr.path_mtu       = mtu;
+  attr.rq_psn         = IB_PSN;
+  attr.max_dest_rd_atomic = 1;
+  attr.min_rnr_timer  = 12;
+  if(isRoCE) {
+    attr.ah_attr.is_global = 1;
+    attr.ah_attr.grh.dgid.global.subnet_prefix = gid.global.subnet_prefix;
+    attr.ah_attr.grh.dgid.global.interface_id = gid.global.interface_id;
+    attr.ah_attr.grh.flow_label = 0;
+    attr.ah_attr.grh.sgid_index = gidIndex;
+    attr.ah_attr.grh.hop_limit = 255;
+  }
+  else {
+    attr.ah_attr.is_global = 0;
+    attr.ah_attr.dlid   = dlid;
+  }
+  attr.ah_attr.sl     = 0;
+  attr.ah_attr.src_path_bits = 0;
+  attr.ah_attr.port_num  = port;
+  attr.dest_qp_num    = dqpn;
+
+  int ret = ibv_modify_qp(qp, &attr,
+              IBV_QP_STATE              |
+              IBV_QP_AV                 |
+              IBV_QP_PATH_MTU           |
+              IBV_QP_DEST_QPN           |
+              IBV_QP_RQ_PSN             |
+              IBV_QP_MAX_DEST_RD_ATOMIC |
+              IBV_QP_MIN_RNR_TIMER);
+  if (ret != 0) {
+    return {ERR_FATAL, "Error during QP RTR. IB Verbs Error code: %d", ret};
+  } else {
+    return ERR_NONE;
+  }
+}
+
+static ErrResult TransitionQpToRts(struct ibv_qp *qp)
+{
+  struct ibv_qp_attr attr = {};
+  memset(&attr, 0, sizeof(struct ibv_qp_attr));
+  attr.qp_state       = IBV_QPS_RTS;
+  attr.sq_psn         = IB_PSN;
+  attr.timeout        = 14;
+  attr.retry_cnt      = 7;
+  attr.rnr_retry      = 7;
+  attr.max_rd_atomic  = 1;
+
+  int ret = ibv_modify_qp(qp, &attr,
+            IBV_QP_STATE     |
+            IBV_QP_TIMEOUT   |
+            IBV_QP_RETRY_CNT |
+            IBV_QP_RNR_RETRY |
+            IBV_QP_SQ_PSN    |
+            IBV_QP_MAX_QP_RD_ATOMIC);
+  if (ret != 0) {
+    return {ERR_FATAL, "Error during QP RTS. IB Verbs Error code: %d", ret};
+  } else {
+    return ERR_NONE;
+  }
+}
+
+static ErrResult  PollIbvCQ(struct ibv_cq*     cq,
+                            int                transferIdx,
+                            std::vector<bool>& sendRecvStat
+                           )
+{
+  int nc = 0;
+  struct ibv_wc wc;
+  // Loop until at least one completion is found
+  while (nc <= 0 && !sendRecvStat[transferIdx]) {
+    // Poll the completion queue
+    nc = ibv_poll_cq(cq, 1, &wc);
+     if(nc > 0) {
+      // Ensure the status of the work completion is successful
+      if(wc.status != IBV_WC_SUCCESS) {
+        return {ERR_FATAL, "Received unsuccessful IBV work completion"};
+      }
+      if(wc.wr_id == transferIdx) break;
+      else {
+        // Lock is not needed.  ibv_poll_cq is thread-safe
+        sendRecvStat[wc.wr_id] = true;
+        // reset to keep looping until my data is at least received
+        nc = 0;
+      }
+    }
+     // Ensure the number of completions polled is non-negative
+    if(nc < 0) {
+      return {ERR_FATAL, "Received negative IBV work completion. ibv_poll_cq returned %d", nc};
+    }
+  }
+  // No need to lock the shared vector. There are two cases
+  // 1. If my receive was accomplished by another thread, my loop won't exit
+  // unless unless the memory location has been sucessefully set by the receiving thread
+  // 2. If my receive was accomplished by my thread, then it is guaranteed that I am the only
+  // one trying to access this location
+  // All of this will change if ibv_poll_cq was not thread-safe
+  sendRecvStat[transferIdx] = false;
+  return ERR_NONE;
+}
+
+static bool IsConfiguredGid(union ibv_gid* gid)
+{
+  const struct in6_addr *a = (struct in6_addr *)gid->raw;
+  int trailer = (a->s6_addr32[1] | a->s6_addr32[2] | a->s6_addr32[3]);
+  if (((a->s6_addr32[0] | trailer) == 0UL) ||
+     ((a->s6_addr32[0] == htonl(0xfe800000)) && (trailer == 0UL))) {
+    return false;
+  }
+  return true;
+}
+
+static bool LinkLocalGid(union ibv_gid* gid)
+{
+  const struct in6_addr *a = (struct in6_addr *)gid->raw;
+  if (a->s6_addr32[0] == htonl(0xfe800000) && a->s6_addr32[1] == 0UL) {
+    return true;
+  }
+  return false;
+}
+
+static bool IsValidGid(union ibv_gid* gid)
+{
+  return (IsConfiguredGid(gid) && !LinkLocalGid(gid));
+}
+
+static sa_family_t GetGidAddressFamily(union ibv_gid* gid)
+{
+  const struct in6_addr *a = (struct in6_addr *)gid->raw;
+  bool isIpV4Mapped = ((a->s6_addr32[0] | a->s6_addr32[1]) |
+                       (a->s6_addr32[2] ^ htonl(0x0000ffff))) == 0UL;
+  bool isIpV4MappedMulticast = (a->s6_addr32[0] == htonl(0xff0e0000) &&
+                               ((a->s6_addr32[1] |
+                                (a->s6_addr32[2] ^ htonl(0x0000ffff))) == 0UL));
+  return (isIpV4Mapped || isIpV4MappedMulticast) ? AF_INET : AF_INET6;
+}
+
+static bool MatchGidAddressFamily(sa_family_t const& af,
+                                  void*              prefix,
+                                  int                prefixlen,
+                                  union ibv_gid*     gid
+                                 )
+{
+  struct in_addr *base = NULL;
+  struct in6_addr *base6 = NULL;
+  struct in6_addr *addr6 = NULL;;
+  if (af == AF_INET) {
+    base = (struct in_addr *)prefix;
+  } else {
+    base6 = (struct in6_addr *)prefix;
+  }
+  addr6 = (struct in6_addr *)gid->raw;
+#define NETMASK(bits) (htonl(0xffffffff ^ ((1 << (32 - bits)) - 1)))
+  int i = 0;
+  while (prefixlen > 0 && i < 4) {
+    if (af == AF_INET) {
+      int mask = NETMASK(prefixlen);
+      if ((base->s_addr & mask) ^ (addr6->s6_addr32[3] & mask)) {
+        break;
+      }
+      prefixlen = 0;
+      break;
+    } else {
+      if (prefixlen >= 32) {
+        if (base6->s6_addr32[i] ^ addr6->s6_addr32[i]) {
+          break;
+        }
+        prefixlen -= 32;
+        ++i;
+      } else {
+        int mask = NETMASK(prefixlen);
+        if ((base6->s6_addr32[i] & mask) ^ (addr6->s6_addr32[i] & mask)) {
+          break;
+        }
+        prefixlen = 0;
+      }
+    }
+  }
+
+  return (prefixlen == 0) ? true : false;
+}
+
+static ErrResult GetRoceVersionNumber(const char* deviceName,
+                                      int const&  portNum,
+                                      int const&  gidIndex,
+                                      int*        version
+                                     )
+  {
+  char gidRoceVerStr[16] = { 0 };
+  char roceTypePath[PATH_MAX] = { 0 };
+  sprintf(roceTypePath, "/sys/class/infiniband/%s/ports/%d/gid_attrs/types/%d",
+          deviceName, portNum, gidIndex);
+
+  int fd = open(roceTypePath, O_RDONLY);
+  if (fd == -1) {
+    return {ERR_FATAL, "Failed while opening RoCE file path (%s)", roceTypePath};
+  }
+
+  int ret = read(fd, gidRoceVerStr, 15);
+  close(fd);
+
+  if (ret == -1) {
+    return {ERR_FATAL, "Failed while reading RoCE version"};
+  }
+
+  if (strlen(gidRoceVerStr)) {
+    if (strncmp(gidRoceVerStr, "IB/RoCE v1", strlen("IB/RoCE v1")) == 0
+     || strncmp(gidRoceVerStr, "RoCE v1", strlen("RoCE v1")) == 0) {
+      *version = 1;
+    }
+    else if (strncmp(gidRoceVerStr, "RoCE v2", strlen("RoCE v2")) == 0) {
+      *version = 2;
+    }
+  }
+
+  return ERR_NONE;
+}
+
+static ErrResult UpdateGidIndex(struct ibv_context* const& context,
+                                uint8_t const&             portNum,
+                                sa_family_t const&         af,
+                                void* const&               prefix,
+                                int const&                 prefixlen,
+                                int const&                 roceVer,
+                                int const&                 gidIndexCandidate,
+                                int*&                      gidIndex
+                                )
+{
+  union ibv_gid gid, gidCandidate;
+  IBV_CALL(ibv_query_gid, context, portNum, *gidIndex, &gid);
+  IBV_CALL(ibv_query_gid, context, portNum, gidIndexCandidate, &gidCandidate);
+
+  sa_family_t usrFam = af;
+  sa_family_t gidFam = GetGidAddressFamily(&gid);
+  sa_family_t gidCandidateFam = GetGidAddressFamily(&gidCandidate);
+  bool gidCandidateMatchSubnet = MatchGidAddressFamily(usrFam, prefix, prefixlen, &gidCandidate);
+
+  if (gidCandidateFam != gidFam && gidCandidateFam == usrFam && gidCandidateMatchSubnet) {
+    *gidIndex = gidIndexCandidate;
+  }
+  else {
+    if (gidCandidateFam != usrFam || !IsValidGid(&gidCandidate) || !gidCandidateMatchSubnet) {
+      return ERR_NONE;
+    }
+    int usrRoceVer = roceVer;
+    int gidRoceVerNum, gidRoceVerNumCandidate;
+    const char* deviceName = ibv_get_device_name(context->device);
+    ERR_CHECK(GetRoceVersionNumber(deviceName, portNum, *gidIndex, &gidRoceVerNum));
+    ERR_CHECK(GetRoceVersionNumber(deviceName, portNum, gidIndexCandidate, &gidRoceVerNumCandidate));
+    if ((gidRoceVerNum != gidRoceVerNumCandidate || !IsValidGid(&gid)) && gidRoceVerNumCandidate == usrRoceVer)
+    {
+      *gidIndex = gidIndexCandidate;
+    }
+  }
+  return ERR_NONE;
+}
+
+static ErrResult SetGidIndex(struct ibv_context* context,
+                             uint8_t const&      portNum,
+                             int const&          gidTblLen,
+                             int const&          roceVersion,
+                             int const&          ipAddressFamily,
+                             int*                gidIndex
+                            )
+{
+  if (*gidIndex >= 0) {
+    return ERR_NONE;
+  }
+  sa_family_t userAddrFamily = (ipAddressFamily == 6)? AF_INET6 : AF_INET;
+
+  int userRoceVersion = roceVersion;
+
+  // TODO: Get address range from user
+  void *prefix = NULL;
+
+  *gidIndex = 0;
+  for (int gidIndexNext = 1; gidIndexNext < gidTblLen; ++gidIndexNext) {
+    ErrResult err = UpdateGidIndex(context, portNum, userAddrFamily,
+                                   prefix, 0, userRoceVersion, gidIndexNext,
+                                   gidIndex);
+    if (err.errType != ERR_NONE) {
+      return err;
+    }
+  }
+  return ERR_NONE;
+}
+
+static ErrResult GetNicCount(int& NicCount)
+{
+  if (_deviceList == NULL && _rdmaNicCount < 0) {
+    ERR_CHECK(InitDeviceList());
+  }
+  NicCount = _rdmaNicCount;
+  return ERR_NONE;
+}
+
+static ErrResult InitRdmaResources(int                   const& deviceID,
+                                   uint8_t               const& port,
+                                   vector<NicResources*> &      resourceMapper
+                                   )
+{
+  if (resourceMapper.size() <= deviceID) {
+    resourceMapper.resize(deviceID + 1);
+    resourceMapper[deviceID] = nullptr;
+  }
+  if (resourceMapper[deviceID] == nullptr) {
+    resourceMapper[deviceID] = new NicResources();
+    auto& rdma = resourceMapper[deviceID];
+    IBV_PTR_CALL(rdma->context, ibv_open_device, _deviceList[deviceID]);
+    IBV_PTR_CALL(rdma->protectionDomain, ibv_alloc_pd, rdma->context);
+    IBV_PTR_CALL(rdma->completionQueue, ibv_create_cq, rdma->context, 100, NULL, NULL, 0);
+    IBV_CALL(ibv_query_port, rdma->context, port, &rdma->portAttr);
+    if (rdma->portAttr.state != IBV_PORT_ACTIVE) {
+      return {ERR_FATAL, "Selected RDMA device %d is down", deviceID};
+    }
+  }
+  return ERR_NONE;
+}
+
+static ErrResult InitRdmaTransferResources(RdmaOptions const& rdmaOptions,
+                                           TransferResources& resources)
+{
+  InitDeviceList();
+  auto && port            = rdmaOptions.ibPort;
+  auto srcGidIndex        = rdmaOptions.ibGidIndex;
+  auto dstGidIndex        = rdmaOptions.ibGidIndex;
+  auto && roceVersion     = rdmaOptions.roceVersion;
+  auto && ipAddrFamily    = rdmaOptions.ipAddressFamily;
+  auto && qpCount         = resources.qpCount;
+  auto && srcDeviceId     = resources.srcNic;
+  auto && dstDeviceId     = resources.dstNic;
+  resources.qpCount       = qpCount;
+  ERR_CHECK(InitRdmaResources(srcDeviceId, port, resources.rdmaResourceMapper));
+  ERR_CHECK(InitRdmaResources(dstDeviceId, port, resources.rdmaResourceMapper));
+  auto && srcRdmaResources = resources.rdmaResourceMapper[srcDeviceId];
+  auto && dstRdmaResources = resources.rdmaResourceMapper[dstDeviceId];
+  auto && senderQp         = resources.senderQp;
+  auto && receiverQp       = resources.receiverQp;
+
+  bool isRoce = srcRdmaResources->portAttr.link_layer == IBV_LINK_LAYER_ETHERNET;
+  assert(srcRdmaResources->portAttr.link_layer == dstRdmaResources->portAttr.link_layer);
+  if(isRoce) {
+    ERR_CHECK(SetGidIndex(srcRdmaResources->context, port,
+                          srcRdmaResources->portAttr.gid_tbl_len,
+                          roceVersion, ipAddrFamily, &srcGidIndex));
+
+    ERR_CHECK(SetGidIndex(dstRdmaResources->context, port,
+                          dstRdmaResources->portAttr.gid_tbl_len,
+                          roceVersion, ipAddrFamily, &dstGidIndex));
+
+    ERR_CHECK(SetIbvGid(srcRdmaResources->context, port,
+                        srcGidIndex, srcRdmaResources->gid));
+
+    ERR_CHECK(SetIbvGid(dstRdmaResources->context, port,
+                        dstGidIndex,dstRdmaResources->gid));
+  }
+
+  assert(senderQp == nullptr);
+  assert(receiverQp == nullptr);
+  assert(qpCount >= 1);
+  senderQp   = new ibv_qp* [qpCount];
+  receiverQp = new ibv_qp* [qpCount];
+  for(int i = 0; i < qpCount; ++i) {
+    ERR_CHECK(CreateQP(srcRdmaResources->protectionDomain,
+                       srcRdmaResources->completionQueue, senderQp[i]));
+
+    ERR_CHECK(CreateQP(dstRdmaResources->protectionDomain,
+                       dstRdmaResources->completionQueue, receiverQp[i]));
+
+    ERR_CHECK(InitQP(senderQp[i], port, rdmaFlags));
+
+    ERR_CHECK(InitQP(receiverQp[i], port, rdmaFlags));
+
+    ERR_CHECK(TransitionQpToRtr(senderQp[i], dstRdmaResources->portAttr.lid,
+                                receiverQp[i]->qp_num, dstRdmaResources->gid,
+                                dstGidIndex, port, isRoce,
+                                srcRdmaResources->portAttr.active_mtu));
+
+    ERR_CHECK(TransitionQpToRts(senderQp[i]));
+
+    ERR_CHECK(TransitionQpToRtr(receiverQp[i], srcRdmaResources->portAttr.lid,
+                                senderQp[i]->qp_num, srcRdmaResources->gid,
+                                srcGidIndex, port, isRoce,
+                                dstRdmaResources->portAttr.active_mtu));
+
+    ERR_CHECK(TransitionQpToRts(receiverQp[i]));
+  }
+  return ERR_NONE;
+}
+
+static ErrResult RegisterRdmaMemoryTransfer(TransferResources& resources,
+                                            int&               transferId)
+{
+  auto && srcDeviceId     = resources.srcNic;
+  auto && dstDeviceId     = resources.dstNic;
+  auto && qpCount         = resources.qpCount;
+  auto && srcRdmaResource = resources.rdmaResourceMapper[srcDeviceId];
+  auto && dstRdmaResource = resources.rdmaResourceMapper[dstDeviceId];
+  struct ibv_mr *src_mr;
+  struct ibv_mr *dst_mr;
+  IBV_PTR_CALL(src_mr, ibv_reg_mr, srcRdmaResource->protectionDomain, resources.srcMem[0],
+               resources.numBytes, rdmaFlags);
+  IBV_PTR_CALL(dst_mr, ibv_reg_mr, dstRdmaResource->protectionDomain, resources.dstMem[0],
+               resources.numBytes, rdmaFlags);
+  resources.sourceMr.push_back(std::make_pair(src_mr, resources.srcMem[0]));
+  resources.destinationMr.push_back(std::make_pair(dst_mr, resources.dstMem[0]));
+  for(int i = 0; i < qpCount; ++i) {
+    resources.receiveStatuses.push_back(false);
+  }
+  resources.messageSizes.push_back(resources.numBytes);
+  transferId = resources.receiveStatuses.size() - qpCount;
+  return ERR_NONE;
+}
+
+static ErrResult TransferRdma(TransferResources& resources,
+                              int         const& transferIdx)
+{
+  int const& qpCount     = resources.qpCount;
+  int const& srcDeviceId = resources.srcNic;
+  assert((transferIdx % qpCount) == 0);
+  uint64_t memIndex = transferIdx / qpCount;
+  auto && srcRdmaResource = resources.rdmaResourceMapper[srcDeviceId];
+  size_t chunkSize = resources.messageSizes[memIndex] / qpCount;
+  size_t remaining_size = resources.messageSizes[memIndex] % qpCount;
+  for (auto i = 0; i < qpCount; ++i) {
+    struct ibv_sge sg = {};
+    struct ibv_send_wr wr = {};
+    size_t currentChunkSize = chunkSize + (i == qpCount - 1 ? remaining_size : 0);
+    sg.addr = (uint64_t)resources.sourceMr[memIndex].second + i * chunkSize;
+    sg.length = currentChunkSize;
+    sg.lkey = resources.sourceMr[memIndex].first->lkey;
+    struct ibv_send_wr *bad_wr;
+    wr.wr_id = transferIdx + i;
+    assert(wr.wr_id < resources.receiveStatuses.size());
+    wr.sg_list = &sg;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_WRITE;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.wr.rdma.remote_addr = (uint64_t)resources.destinationMr[memIndex].second + i * chunkSize;
+    wr.wr.rdma.rkey = resources.destinationMr[memIndex].first->rkey;
+    IBV_CALL(ibv_post_send, resources.senderQp[i], &wr, &bad_wr);
+  }
+  for(auto i = 0; i < qpCount; ++i) {
+    ERR_CHECK(PollIbvCQ(srcRdmaResource->completionQueue, transferIdx + i, resources.receiveStatuses));
+  }
+  return ERR_NONE;
+}
+
+static ErrResult TeardownRdma(TransferResources& resources)
+{
+  auto&& sourceMr    = resources.sourceMr;
+  auto&& dstMr       = resources.destinationMr;
+  auto&& senderQp    = resources.senderQp;
+  auto&& receiverQp  = resources.receiverQp;
+  auto&& srcDeviceId = resources.srcNic;
+  auto&& dstDeviceId = resources.dstNic;
+  auto&& qpCount     = resources.qpCount;
+  if (sourceMr.size() > 0) {
+    for(auto mr : sourceMr) {
+      IBV_CALL(ibv_dereg_mr, mr.first);
+    }
+    sourceMr.clear();
+  }
+  if (dstMr.size() > 0) {
+    for(auto mr : dstMr) {
+      IBV_CALL(ibv_dereg_mr, mr.first);
+    }
+    dstMr.clear();
+  }
+  resources.receiveStatuses.clear();
+  resources.messageSizes.clear();
+
+  if (senderQp) {
+    for (int i = 0; i < qpCount; ++i) {
+      IBV_CALL(ibv_destroy_qp, senderQp[i]);
+      senderQp[i] = nullptr;
+    }
+    delete[] senderQp;
+    senderQp = nullptr;
+  }
+  if (receiverQp) {
+    for (int i = 0; i < qpCount; ++i) {
+      IBV_CALL(ibv_destroy_qp, receiverQp[i]);
+      receiverQp[i] = nullptr;
+    }
+    delete[] receiverQp;
+    receiverQp = nullptr;
+  }
+  auto& srcRdmaResource = resources.rdmaResourceMapper[srcDeviceId];
+  auto& dstRdmaResource = resources.rdmaResourceMapper[dstDeviceId];
+
+  if (srcRdmaResource != nullptr) {
+    if (srcRdmaResource->completionQueue) {
+      IBV_CALL(ibv_destroy_cq, srcRdmaResource->completionQueue);
+      srcRdmaResource->completionQueue = nullptr;
+    }
+    if (srcRdmaResource->protectionDomain) {
+      IBV_CALL(ibv_dealloc_pd, srcRdmaResource->protectionDomain);
+      srcRdmaResource->protectionDomain = nullptr;
+    }
+    if (srcRdmaResource->context) {
+      IBV_CALL(ibv_close_device, srcRdmaResource->context);
+      srcRdmaResource->context = nullptr;
+    }
+    srcRdmaResource = nullptr;
+  }
+
+  if (dstRdmaResource != nullptr) {
+    if (dstRdmaResource->completionQueue) {
+      IBV_CALL(ibv_destroy_cq, dstRdmaResource->completionQueue);
+      dstRdmaResource->completionQueue = nullptr;
+    }
+    if (dstRdmaResource->protectionDomain) {
+      IBV_CALL(ibv_dealloc_pd, dstRdmaResource->protectionDomain);
+      dstRdmaResource->protectionDomain = nullptr;
+    }
+    if (dstRdmaResource->context) {
+      IBV_CALL(ibv_close_device, dstRdmaResource->context);
+      dstRdmaResource->context = nullptr;
+    }
+    dstRdmaResource = nullptr;
+  }
+  return ERR_NONE;
+}
+#endif // end of the IBV_EXEC code
+
 // Data validation-related functions
 //========================================================================================
 
@@ -1511,16 +2489,7 @@ namespace {
 
     return ERR_NONE;
   }
-#ifndef NO_IBV_EXEC
-static ErrResult InitRdmaTransferResources(RdmaOptions       const& rdmaOptions,
-                                           TransferResources &      resources);
 
-static ErrResult RegisterRdmaMemoryTransfer(TransferResources &      resources,
-                                            int               & transferId);
-static ErrResult TransferRdma(TransferResources & resources,
-                              int               const& transferIdx);
-static ErrResult TeardownRdma(TransferResources & resources);
-#endif
   // Prepare each executor
   // Allocates memory for src/dst, prepares subexecutors, executor-specific data structures
   static ErrResult PrepareExecutor(ConfigOptions    const& cfg,
@@ -1705,7 +2674,7 @@ static ErrResult TeardownRdma(TransferResources & resources);
 #ifndef NO_IBV_EXEC
       if(IsRdmaExeType(exeDevice.exeType)) {
         ERR_CHECK(TeardownRdma(resources));
-      }
+     }
 #endif
     }
 
@@ -2328,976 +3297,6 @@ static ErrResult TeardownRdma(TransferResources & resources);
       exeInfo.totalDurationMsec += deltaMsec;
     return ERR_NONE;
   }
-
-// IB Verbs-related functions
-//========================================================================================
-
-#ifndef NO_IBV_EXEC
-#define MAX_SEND_WR_PER_QP 12
-#define MAX_RECV_WR_PER_QP 12
-const unsigned int rdmaFlags = IBV_ACCESS_LOCAL_WRITE    |
-                               IBV_ACCESS_REMOTE_READ    |
-                               IBV_ACCESS_REMOTE_WRITE   |
-                               IBV_ACCESS_REMOTE_ATOMIC;
-#define IB_PSN  0
-#define INIT_ONCE(flag)\
-  do {                 \
-  if(flag) return;     \
-  else flag = true;    \
-  } while(0);
-
-const  uint64_t WR_ID = 1789;
-static ibv_device** _deviceList = nullptr;
-static int _rdmaNicCount        = -1;
-static std::vector<std::string> _ibDeviceBusIds;
-static std::vector<std::set<int>> _nicToGpuMapper;
-static std::vector<int> _gpuToNicMapper;
-static std::vector<std::string> _deviceNames;
-static bool _deviceMappingInit  = false;
-static bool _pcieTreeInit = false;
-static bool _multiportFlag = false;
-
-class PCIe_tree
-{
-public:
-  std::set<PCIe_tree> children;
-  std::string address;
-  std::string description;
-
-  // Constructor
-  PCIe_tree(const std::string& addr) : address(addr) {}
-
-    // Constructor
-  PCIe_tree(const std::string& addr, const std::string& desc)
-           :address(addr), description(desc) {}
-
-  // Default constructor
-  PCIe_tree() : address(""), description("") {}
-
-  // Comparison operator for std::set
-  bool operator<(const PCIe_tree& other) const {
-    return address < other.address;
-  }
-
-  // Function to find a node by address
-  const PCIe_tree* find(const std::string& addr) const {
-    if (address == addr) {
-      return this;
-    }
-    for (const auto& child : children) {
-      const PCIe_tree* result = child.find(addr);
-      if (result) {
-        return result;
-      }
-    }
-    return nullptr;
-  }
-};
-
-static PCIe_tree pcie_root;
-
-static void InsertPCIePathToTree(PCIe_tree* root, const std::string& pcieAddress, const std::string& description)
-{
-  std::filesystem::path devicePath = "/sys/bus/pci/devices/" + pcieAddress;
-  if (!std::filesystem::exists(devicePath)) {
-    printf("[ERROR] Device path %s does not exist\n", devicePath.c_str());
-    return;
-  }
-  std::string canonicalPath = std::filesystem::canonical(devicePath).string();
-  std::istringstream iss(canonicalPath);
-  std::string token;
-  PCIe_tree* currentNode = root;
-
-  while (std::getline(iss, token, '/')) {
-    std::string address = token;
-    auto it = currentNode->children.find(PCIe_tree(address));
-    if (it == currentNode->children.end()) {
-      currentNode->children.insert(PCIe_tree(address));
-      it = currentNode->children.find(PCIe_tree(address));
-    }
-    currentNode = const_cast<PCIe_tree*>(&(*it));
-  }
-  currentNode->description = description;
-}
-
-static const PCIe_tree* getLcaBetweenNodes(const PCIe_tree* root, std::string node1, std::string node2)
-{
-  if (!root || root->address == node1 || root->address == node2) {
-    return root;
-  }
-
-  const PCIe_tree* leftLCA = nullptr;
-  const PCIe_tree* rightLCA = nullptr;
-
-  for (const auto& child : root->children) {
-    const PCIe_tree* lca = getLcaBetweenNodes(&child, node1, node2);
-    if (lca) {
-      if (leftLCA) {
-        rightLCA = lca;
-        break;
-      } else {
-        leftLCA = lca;
-      }
-    }
-  }
-
-  if (leftLCA && rightLCA) {
-    return root;
-  }
-
-  return leftLCA ? leftLCA : rightLCA;
-}
-
-static int GetLcaDepth(std::string      const& targetBusID,
-                       const PCIe_tree* const& node,
-                       int                     depth = 0)
-{
-  if (!node) {
-    return -1;
-  }
-  if (targetBusID == node->address) {
-    return depth;
-  }
-  for (auto&& child : node->children) {
-    int distance = GetLcaDepth(targetBusID, &child, depth + 1);
-    if (distance != -1) {
-      return distance;
-    }
-  }
-  return -1;
-}
-
-// Function to extract the bus number from a PCIe address (domain:bus:device.function)
-static int ExtractBusNumber(std::string const& pcieAddress)
-{
-  int domain, bus, device, function;
-  char delimiter;
-
-  std::istringstream iss(pcieAddress);
-  iss >> std::hex >> domain >> delimiter >> bus >> delimiter >> device >> delimiter >> function;
-
-  if (iss.fail()) {
-    printf("Invalid PCIe address format: %s\n", pcieAddress.c_str());
-    return -1; // Invalid bus number
-  }
-
-  return bus;
-}
-
-// Function to compute the distance between two bus IDs
-static int GetBusIdDistance(std::string const& pcieAddress1,
-                            std::string const& pcieAddress2)
-{
-  int bus1 = ExtractBusNumber(pcieAddress1);
-  int bus2 = ExtractBusNumber(pcieAddress2);
-  return (bus1 < 0 || bus2 < 0)? -1 : std::abs(bus1 - bus2);
-}
-
-static int GetNearestPcieDeviceInTree(PCIe_tree                const& root,
-                                      std::string              const& busID,
-                                      std::vector<std::string> const& targetBusIds)
-{
-  int max_depth = -1;
-  int index_of_closest = -1;
-  std::vector <int> matches;
-  for (const auto& targetBusID : targetBusIds) {
-    if (targetBusID.empty()) continue;
-    const PCIe_tree* lca = getLcaBetweenNodes(&root, busID, targetBusID);
-    if (lca) {
-      int depth = GetLcaDepth(lca->address, &pcie_root);
-      if (depth > max_depth) {
-        max_depth = depth;
-        index_of_closest = &targetBusID - &targetBusIds[0];
-        matches.clear(); // found a new max depth
-        matches.push_back(index_of_closest);
-      } else if(depth == max_depth && depth >= 0) {
-        matches.push_back(&targetBusID - &targetBusIds[0]);
-      }
-    }
-  }
-  // 1. When more than one LCA match is found, opt for the one with the smallest
-  // bus id difference
-  // 2. Also cover when two NICs have the same busIds which indicates a dualport case
-  // (only two ports supported)
-  if(matches.size() > 1) {
-    int minDistance = std::numeric_limits<int>::max();
-    for (int i = 0; i < matches.size(); ++i) {
-      for(int j = i + 1; j < matches.size(); ++j) {
-        // Multiport NIC
-        if(ExtractBusNumber(targetBusIds[matches[i]]) == ExtractBusNumber(targetBusIds[matches[j]])) {
-          index_of_closest = !_multiportFlag? matches[i] : matches[j];
-          // Workaround to distribute ports over GPUs
-          _multiportFlag = !_multiportFlag;
-          return index_of_closest;
-        }
-      }
-      int distance = GetBusIdDistance(busID, targetBusIds[matches[i]]);
-      if (distance < minDistance) {
-        minDistance = distance;
-        index_of_closest = matches[i];
-      }
-    }
-  }
-  return index_of_closest;
-}
-
-static ErrResult InitDeviceList()
-{
-  if (_deviceList == NULL) {
-    IBV_PTR_CALL(_deviceList, ibv_get_device_list, &_rdmaNicCount);
-  }
-  return ERR_NONE;
-}
-
-static void BuildPCIeTree()
-{
-  INIT_ONCE(_pcieTreeInit);
-  ErrResult error = InitDeviceList();
-  if(error.errType != ERR_NONE) {
-    printf("Failed to get IB devices list.\n");
-    return;
-  }
-  _ibDeviceBusIds.resize(_rdmaNicCount, "");
-  _nicToGpuMapper.resize(_rdmaNicCount);
-  _deviceNames.resize(_rdmaNicCount);
-
-  for (int i = 0; i < _rdmaNicCount; ++i) {
-    struct ibv_device *device = _deviceList[i];
-    _deviceNames[i] = device->name;
-    struct ibv_context *context = ibv_open_device(device);
-    if (!context) {
-      printf("Failed to open device %s\n", device->name);
-      continue;
-    }
-
-    struct ibv_device_attr deviceAttr;
-    if (ibv_query_device(context, &deviceAttr)) {
-      printf("Failed to query device attributes for %s\n", device->name);
-      ibv_close_device(context);
-      continue;
-    }
-
-    bool portActive = false;
-    for (int port = 1; port <= deviceAttr.phys_port_cnt; ++port) {
-      struct ibv_port_attr portAttr;
-      if (ibv_query_port(context, port, &portAttr)) {
-        printf("Failed to query port %d attributes for %s\n", port, device->name);
-        continue;
-      }
-      if (portAttr.state == IBV_PORT_ACTIVE) {
-        portActive = true;
-        break;
-      }
-    }
-
-    ibv_close_device(context);
-
-    if (!portActive) {
-      continue;
-    }
-
-    std::string device_path(device->dev_path);
-    if (std::filesystem::exists(device_path)) {
-      std::string pciPath = std::filesystem::canonical(device_path + "/device").string();
-      std::size_t pos = pciPath.find_last_of('/');
-      if (pos != std::string::npos) {
-        std::string nicBusId = pciPath.substr(pos + 1);
-        _ibDeviceBusIds[i] = nicBusId;
-        InsertPCIePathToTree(&pcie_root, nicBusId, _deviceNames[i]);
-      }
-    }
-  }
-
-  int gpuCount = GetNumExecutors(EXE_GPU_GFX);
-  _gpuToNicMapper.resize(gpuCount, -1);
-  for (int i = 0; i < gpuCount; ++i) {
-    char hipPciBusId[64];
-    hipError_t err = hipDeviceGetPCIBusId(hipPciBusId, sizeof(hipPciBusId), i);
-    if (err != hipSuccess) {
-      printf("Failed to get PCI Bus ID for HIP device %d: %s\n", i, hipGetErrorString(err));
-      return;
-    }
-    InsertPCIePathToTree(&pcie_root, hipPciBusId, "GPU " + std::to_string(i));
-  }
-}
-
-static int GetClosestRdmaNicId(int hipDeviceId)
-{
-  char hipPciBusId[64];
-  hipError_t err = hipDeviceGetPCIBusId(hipPciBusId, sizeof(hipPciBusId), hipDeviceId);
-  if (err != hipSuccess) {
-    printf("Failed to get PCI Bus ID for HIP device %d: %s\n", hipDeviceId, hipGetErrorString(err));
-    return -1;
-  }
-  int closestRdmaNicId = GetNearestPcieDeviceInTree(pcie_root, hipPciBusId, _ibDeviceBusIds);
-  // The following will only use distance between bus IDs
-  // to determine the closest NIC to GPU if the PCIe tree approach fails
-  if(closestRdmaNicId < 0) {
-    printf("[Warn] falling back to PCIe bus ID distance to determine proximity\n");
-    int minDistance = std::numeric_limits<int>::max();
-    for (int i = 0; i < _ibDeviceBusIds.size(); ++i) {
-      auto address = _ibDeviceBusIds[i];
-      if (address != "") {
-        int distance = GetBusIdDistance(hipPciBusId, address);
-        if (distance < minDistance && distance >= 0) {
-          minDistance = distance;
-          closestRdmaNicId = i;
-        }
-      }
-    }
-  }
-  return closestRdmaNicId;
-}
-
-static int GetClosestGpuDeviceId(int IbvDeviceId)
-{
-  BuildPCIeTree();
-  assert(IbvDeviceId < _ibDeviceBusIds.size());
-  auto address = _ibDeviceBusIds[IbvDeviceId];
-  if (address.empty()) return -1;
-  int closestDevice = -1;
-  int minDistance = std::numeric_limits<int>::max();
-  int gpuCount = GetNumExecutors(EXE_GPU_GFX);
-  for (int i = 0; i < gpuCount; ++i) {
-    char hipPciBusId[64];
-    hipError_t err = hipDeviceGetPCIBusId(hipPciBusId, sizeof(hipPciBusId), i);
-    if (err != hipSuccess) {
-      printf("Failed to get PCI Bus ID for HIP device %d: %s\n", i, hipGetErrorString(err));
-      return -1;
-    }
-    int distance = GetBusIdDistance(hipPciBusId, address);
-    if (distance < minDistance && distance >= 0) {
-      minDistance = distance;
-      closestDevice = i;
-    }
-  }
-  return closestDevice;
-}
-
-static void InitDeviceMappings()
-{
-  INIT_ONCE(_deviceMappingInit);
-  BuildPCIeTree();
-  int gpuCount = GetNumExecutors(EXE_GPU_GFX);
-  for (int i = 0; i < gpuCount; ++i) {
-    int closestIbDevice = GetClosestRdmaNicId(i);
-    _gpuToNicMapper[i] = closestIbDevice;
-    if(closestIbDevice >= 0) {
-      assert(closestIbDevice < _nicToGpuMapper.size());
-      _nicToGpuMapper[closestIbDevice].insert(i);
-    }
-  }
-}
-
-static int GetClosestIbDevice(int hipDeviceId)
-{
-  InitDeviceMappings();
-  assert(hipDeviceId < _gpuToNicMapper.size());
-  return _gpuToNicMapper[hipDeviceId];
-}
-
-static void PrintPCIeTree(PCIe_tree   const& node,
-                          std::string const& prefix = "",
-                          bool               isLast = true)
-{
-  if(!node.address.empty()) {
-    printf("%s%s%s", prefix.c_str(), (isLast ? "└── " : "├── "), node.address.c_str());
-    if(!node.description.empty()) {
-      printf("(%s)", node.description.c_str());
-    }
-    printf("\n");
-  }
-  const auto& children = node.children;
-  for (auto it = children.begin(); it != children.end(); ++it) {
-    PrintPCIeTree(*it, prefix + (isLast ? "    " : "│   "), std::next(it) == children.end());
-  }
-}
-
-static ErrResult CreateQP(struct ibv_pd *pd,
-                          struct ibv_cq *cq,
-                          struct ibv_qp *& qp)
-{
-
-  struct ibv_qp_init_attr attr = {};
-  memset(&attr, 0, sizeof(struct ibv_qp_init_attr));
-  attr.send_cq = cq;
-  attr.recv_cq = cq;
-  attr.cap.max_send_wr  = MAX_SEND_WR_PER_QP;
-  attr.cap.max_recv_wr  = MAX_RECV_WR_PER_QP;
-  attr.cap.max_send_sge = 1;
-  attr.cap.max_recv_sge = 1;
-  attr.qp_type = IBV_QPT_RC;
-  qp = ibv_create_qp(pd, &attr);
-  if(qp == NULL) {
-    return {ERR_FATAL, "Error while creating QP"};
-  } else {
-    return ERR_NONE;
-  }
-}
-
-static ErrResult InitQP(struct ibv_qp* qp,
-                        uint8_t        port,
-                        unsigned       flags)
-{
-  struct ibv_qp_attr attr = {};        // Initialize the QP attributes structure to zero
-  memset(&attr, 0, sizeof(struct ibv_qp_attr));
-  attr.qp_state   = IBV_QPS_INIT;      // Set the QP state to INIT
-  attr.pkey_index = 0;                 // Set the partition key index to 0
-  attr.port_num   = port;              // Set the port number to the defined IB_PORT
-  attr.qp_access_flags = flags;        // Set the QP access flags to the provided flags
-
-  int ret = ibv_modify_qp(qp, &attr,
-           IBV_QP_STATE      |      // Modify the QP state
-           IBV_QP_PKEY_INDEX |      // Modify the partition key index
-           IBV_QP_PORT       |      // Modify the port number
-           IBV_QP_ACCESS_FLAGS);    // Modify the access flags
-
-  if (ret != 0) {
-    return {ERR_FATAL, "Error during QP Init. IB Verbs Error code: %d", ret};
-  } else {
-    return ERR_NONE;
-  }
-}
-
-static ErrResult SetIbvGid(ibv_context* const&  ctx,
-                           uint8_t      const&  portNum,
-                           int          const&  gidIndex,
-                           ibv_gid&             gid)
-{
-  IBV_CALL(ibv_query_gid, ctx, portNum, gidIndex, &gid);
-  return ERR_NONE;
-}
-
-static ErrResult TransitionQpToRtr(ibv_qp*         qp,
-                                   uint16_t const& dlid,
-                                   uint32_t const& dqpn,
-                                   ibv_gid  const& gid,
-                                   uint8_t  const& gidIndex,
-                                   uint8_t  const& port,
-                                   bool     const& isRoCE,
-                                   ibv_mtu  const& mtu)
-{
-  struct ibv_qp_attr attr = {};
-  memset(&attr, 0, sizeof(struct ibv_qp_attr));
-  attr.qp_state       = IBV_QPS_RTR;
-  attr.path_mtu       = mtu;
-  attr.rq_psn         = IB_PSN;
-  attr.max_dest_rd_atomic = 1;
-  attr.min_rnr_timer  = 12;
-  if(isRoCE) {
-    attr.ah_attr.is_global = 1;
-    attr.ah_attr.grh.dgid.global.subnet_prefix = gid.global.subnet_prefix;
-    attr.ah_attr.grh.dgid.global.interface_id = gid.global.interface_id;
-    attr.ah_attr.grh.flow_label = 0;
-    attr.ah_attr.grh.sgid_index = gidIndex;
-    attr.ah_attr.grh.hop_limit = 255;
-  }
-  else {
-    attr.ah_attr.is_global = 0;
-    attr.ah_attr.dlid   = dlid;
-  }
-  attr.ah_attr.sl     = 0;
-  attr.ah_attr.src_path_bits = 0;
-  attr.ah_attr.port_num  = port;
-  attr.dest_qp_num    = dqpn;
-
-  int ret = ibv_modify_qp(qp, &attr,
-              IBV_QP_STATE              |
-              IBV_QP_AV                 |
-              IBV_QP_PATH_MTU           |
-              IBV_QP_DEST_QPN           |
-              IBV_QP_RQ_PSN             |
-              IBV_QP_MAX_DEST_RD_ATOMIC |
-              IBV_QP_MIN_RNR_TIMER);
-  if (ret != 0) {
-    return {ERR_FATAL, "Error during QP RTR. IB Verbs Error code: %d", ret};
-  } else {
-    return ERR_NONE;
-  }
-}
-
-static ErrResult TransitionQpToRts(struct ibv_qp *qp)
-{
-  struct ibv_qp_attr attr = {};
-  memset(&attr, 0, sizeof(struct ibv_qp_attr));
-  attr.qp_state       = IBV_QPS_RTS;
-  attr.sq_psn         = IB_PSN;
-  attr.timeout        = 14;
-  attr.retry_cnt      = 7;
-  attr.rnr_retry      = 7;
-  attr.max_rd_atomic  = 1;
-
-  int ret = ibv_modify_qp(qp, &attr,
-            IBV_QP_STATE     |
-            IBV_QP_TIMEOUT   |
-            IBV_QP_RETRY_CNT |
-            IBV_QP_RNR_RETRY |
-            IBV_QP_SQ_PSN    |
-            IBV_QP_MAX_QP_RD_ATOMIC);
-  if (ret != 0) {
-    return {ERR_FATAL, "Error during QP RTS. IB Verbs Error code: %d", ret};
-  } else {
-    return ERR_NONE;
-  }
-}
-
-static ErrResult  PollIbvCQ(struct ibv_cq*     cq,
-                            int                transferIdx,
-                            std::vector<bool>& sendRecvStat)
-{
-  int nc = 0;
-  struct ibv_wc wc;
-  // Loop until at least one completion is found
-  while (nc <= 0 && !sendRecvStat[transferIdx]) {
-    // Poll the completion queue
-    nc = ibv_poll_cq(cq, 1, &wc);
-     if(nc > 0) {
-      // Ensure the status of the work completion is successful
-      if(wc.status != IBV_WC_SUCCESS) {
-        return {ERR_FATAL, "Received unsuccessful IBV work completion"};
-      }
-      if(wc.wr_id == transferIdx) break;
-      else {
-        // Lock is not needed.  ibv_poll_cq is thread-safe
-        sendRecvStat[wc.wr_id] = true;
-        // reset to keep looping until my data is at least received
-        nc = 0;
-      }
-    }
-     // Ensure the number of completions polled is non-negative
-    if(nc < 0) {
-      return {ERR_FATAL, "Received negative IBV work completion. ibv_poll_cq returned %d", nc};
-    }
-  }
-  // No need to lock the shared vector. There are two cases
-  // 1. If my receive was accomplished by another thread, my loop won't exit
-  // unless unless the memory location has been sucessefully set by the receiving thread
-  // 2. If my receive was accomplished by my thread, then it is guaranteed that I am the only
-  // one trying to access this location
-  // All of this will change if ibv_poll_cq was not thread-safe
-  sendRecvStat[transferIdx] = false;
-  return ERR_NONE;
-}
-
-static bool IsConfiguredGid(union ibv_gid* gid)
-{
-  const struct in6_addr *a = (struct in6_addr *)gid->raw;
-  int trailer = (a->s6_addr32[1] | a->s6_addr32[2] | a->s6_addr32[3]);
-  if (((a->s6_addr32[0] | trailer) == 0UL) ||
-     ((a->s6_addr32[0] == htonl(0xfe800000)) && (trailer == 0UL))) {
-    return false;
-  }
-  return true;
-}
-
-static bool LinkLocalGid(union ibv_gid* gid)
-{
-  const struct in6_addr *a = (struct in6_addr *)gid->raw;
-  if (a->s6_addr32[0] == htonl(0xfe800000) && a->s6_addr32[1] == 0UL) {
-    return true;
-  }
-  return false;
-}
-
-static bool IsValidGid(union ibv_gid* gid)
-{
-  return (IsConfiguredGid(gid) && !LinkLocalGid(gid));
-}
-
-static sa_family_t GetGidAddressFamily(union ibv_gid* gid)
-{
-  const struct in6_addr *a = (struct in6_addr *)gid->raw;
-  bool isIpV4Mapped = ((a->s6_addr32[0] | a->s6_addr32[1]) |
-                       (a->s6_addr32[2] ^ htonl(0x0000ffff))) == 0UL;
-  bool isIpV4MappedMulticast = (a->s6_addr32[0] == htonl(0xff0e0000) &&
-                               ((a->s6_addr32[1] |
-                                (a->s6_addr32[2] ^ htonl(0x0000ffff))) == 0UL));
-  return (isIpV4Mapped || isIpV4MappedMulticast) ? AF_INET : AF_INET6;
-}
-
-static bool MatchGidAddressFamily(sa_family_t const& af,
-                                  void*              prefix,
-                                  int                prefixlen,
-                                  union ibv_gid*     gid)
-{
-  struct in_addr *base = NULL;
-  struct in6_addr *base6 = NULL;
-  struct in6_addr *addr6 = NULL;;
-  if (af == AF_INET) {
-    base = (struct in_addr *)prefix;
-  } else {
-    base6 = (struct in6_addr *)prefix;
-  }
-  addr6 = (struct in6_addr *)gid->raw;
-#define NETMASK(bits) (htonl(0xffffffff ^ ((1 << (32 - bits)) - 1)))
-  int i = 0;
-  while (prefixlen > 0 && i < 4) {
-    if (af == AF_INET) {
-      int mask = NETMASK(prefixlen);
-      if ((base->s_addr & mask) ^ (addr6->s6_addr32[3] & mask)) {
-        break;
-      }
-      prefixlen = 0;
-      break;
-    } else {
-      if (prefixlen >= 32) {
-        if (base6->s6_addr32[i] ^ addr6->s6_addr32[i]) {
-          break;
-        }
-        prefixlen -= 32;
-        ++i;
-      } else {
-        int mask = NETMASK(prefixlen);
-        if ((base6->s6_addr32[i] & mask) ^ (addr6->s6_addr32[i] & mask)) {
-          break;
-        }
-        prefixlen = 0;
-      }
-    }
-  }
-
-  return (prefixlen == 0) ? true : false;
-}
-
-static ErrResult GetRoceVersionNumber(const char* deviceName,
-                                      int const&  portNum,
-                                      int const&  gidIndex,
-                                      int*        version)
-  {
-  char gidRoceVerStr[16] = { 0 };
-  char roceTypePath[PATH_MAX] = { 0 };
-  sprintf(roceTypePath, "/sys/class/infiniband/%s/ports/%d/gid_attrs/types/%d",
-          deviceName, portNum, gidIndex);
-
-  int fd = open(roceTypePath, O_RDONLY);
-  if (fd == -1) {
-    return {ERR_FATAL, "Failed while opening RoCE file path (%s)", roceTypePath};
-  }
-
-  int ret = read(fd, gidRoceVerStr, 15);
-  close(fd);
-
-  if (ret == -1) {
-    return {ERR_FATAL, "Failed while reading RoCE version"};
-  }
-
-  if (strlen(gidRoceVerStr)) {
-    if (strncmp(gidRoceVerStr, "IB/RoCE v1", strlen("IB/RoCE v1")) == 0
-     || strncmp(gidRoceVerStr, "RoCE v1", strlen("RoCE v1")) == 0) {
-      *version = 1;
-    }
-    else if (strncmp(gidRoceVerStr, "RoCE v2", strlen("RoCE v2")) == 0) {
-      *version = 2;
-    }
-  }
-
-  return ERR_NONE;
-}
-
-static ErrResult UpdateGidIndex(struct ibv_context* const& context,
-                                uint8_t const&             portNum,
-                                sa_family_t const&         af,
-                                void* const&               prefix,
-                                int const&                 prefixlen,
-                                int const&                 roceVer,
-                                int const&                 gidIndexCandidate,
-                                int*&                      gidIndex)
-{
-  union ibv_gid gid, gidCandidate;
-  IBV_CALL(ibv_query_gid, context, portNum, *gidIndex, &gid);
-  IBV_CALL(ibv_query_gid, context, portNum, gidIndexCandidate, &gidCandidate);
-
-  sa_family_t usrFam = af;
-  sa_family_t gidFam = GetGidAddressFamily(&gid);
-  sa_family_t gidCandidateFam = GetGidAddressFamily(&gidCandidate);
-  bool gidCandidateMatchSubnet = MatchGidAddressFamily(usrFam, prefix, prefixlen, &gidCandidate);
-
-  if (gidCandidateFam != gidFam && gidCandidateFam == usrFam && gidCandidateMatchSubnet) {
-    *gidIndex = gidIndexCandidate;
-  }
-  else {
-    if (gidCandidateFam != usrFam || !IsValidGid(&gidCandidate) || !gidCandidateMatchSubnet) {
-      return ERR_NONE;
-    }
-    int usrRoceVer = roceVer;
-    int gidRoceVerNum, gidRoceVerNumCandidate;
-    const char* deviceName = ibv_get_device_name(context->device);
-    ERR_CHECK(GetRoceVersionNumber(deviceName, portNum, *gidIndex, &gidRoceVerNum));
-    ERR_CHECK(GetRoceVersionNumber(deviceName, portNum, gidIndexCandidate, &gidRoceVerNumCandidate));
-    if ((gidRoceVerNum != gidRoceVerNumCandidate || !IsValidGid(&gid)) && gidRoceVerNumCandidate == usrRoceVer)
-    {
-      *gidIndex = gidIndexCandidate;
-    }
-  }
-  return ERR_NONE;
-}
-
-static ErrResult SetGidIndex(struct ibv_context* context,
-                             uint8_t const&      portNum,
-                             int const&          gidTblLen,
-                             int const&          roceVersion,
-                             int const&          ipAddressFamily,
-                             int*                gidIndex)
-{
-  if (*gidIndex >= 0) {
-    return ERR_NONE;
-  }
-  sa_family_t userAddrFamily = (ipAddressFamily == 6)? AF_INET6 : AF_INET;
-
-  int userRoceVersion = roceVersion;
-
-  // TODO: Get address range from user
-  void *prefix = NULL;
-
-  *gidIndex = 0;
-  for (int gidIndexNext = 1; gidIndexNext < gidTblLen; ++gidIndexNext) {
-    ErrResult err = UpdateGidIndex(context, portNum, userAddrFamily,
-                                   prefix, 0, userRoceVersion, gidIndexNext,
-                                   gidIndex);
-    if (err.errType != ERR_NONE) {
-      return err;
-    }
-  }
-  return ERR_NONE;
-}
-
-static ErrResult GetNicCount(int& NicCount)
-{
-  if (_deviceList == NULL && _rdmaNicCount < 0) {
-    ERR_CHECK(InitDeviceList());
-  }
-  NicCount = _rdmaNicCount;
-  return ERR_NONE;
-}
-
-static ErrResult InitRdmaResources(int                   const& deviceID,
-                                   uint8_t               const& port,
-                                   vector<NicResources*> &      resourceMapper)
-{
-  if (resourceMapper.size() <= deviceID) {
-    resourceMapper.resize(deviceID + 1);
-    resourceMapper[deviceID] = nullptr;
-  }
-  if (resourceMapper[deviceID] == nullptr) {
-    resourceMapper[deviceID] = new NicResources();
-    auto& rdma = resourceMapper[deviceID];
-    IBV_PTR_CALL(rdma->context, ibv_open_device, _deviceList[deviceID]);
-    IBV_PTR_CALL(rdma->protectionDomain, ibv_alloc_pd, rdma->context);
-    IBV_PTR_CALL(rdma->completionQueue, ibv_create_cq, rdma->context, 100, NULL, NULL, 0);
-    IBV_CALL(ibv_query_port, rdma->context, port, &rdma->portAttr);
-    if (rdma->portAttr.state != IBV_PORT_ACTIVE) {
-      return {ERR_FATAL, "Selected RDMA device %d is down", deviceID};
-    }
-  }
-  return ERR_NONE;
-}
-
-static ErrResult InitRdmaTransferResources(RdmaOptions       const& rdmaOptions,
-                                           TransferResources&       resources)
-{
-  InitDeviceList();
-  auto&& port            = rdmaOptions.ibPort;
-  auto srcGidIndex        = rdmaOptions.ibGidIndex;
-  auto dstGidIndex        = rdmaOptions.ibGidIndex;
-  auto&& roceVersion     = rdmaOptions.roceVersion;
-  auto&& ipAddrFamily    = rdmaOptions.ipAddressFamily;
-  auto&& qpCount         = resources.qpCount;
-  auto&& srcDeviceId     = resources.srcNic;
-  auto&& dstDeviceId     = resources.dstNic;
-  resources.qpCount       = qpCount;
-  ERR_CHECK(InitRdmaResources(srcDeviceId, port, resources.rdmaResourceMapper));
-  ERR_CHECK(InitRdmaResources(dstDeviceId, port, resources.rdmaResourceMapper));
-  auto&& srcRdmaResources = resources.rdmaResourceMapper[srcDeviceId];
-  auto&& dstRdmaResources = resources.rdmaResourceMapper[dstDeviceId];
-  auto&& senderQp         = resources.senderQp;
-  auto&& receiverQp       = resources.receiverQp;
-
-  bool isRoce = srcRdmaResources->portAttr.link_layer == IBV_LINK_LAYER_ETHERNET;
-  assert(srcRdmaResources->portAttr.link_layer == dstRdmaResources->portAttr.link_layer);
-  if(isRoce) {
-    ERR_CHECK(SetGidIndex(srcRdmaResources->context, port,
-                          srcRdmaResources->portAttr.gid_tbl_len,
-                          roceVersion, ipAddrFamily, &srcGidIndex));
-
-    ERR_CHECK(SetGidIndex(dstRdmaResources->context, port,
-                          dstRdmaResources->portAttr.gid_tbl_len,
-                          roceVersion, ipAddrFamily, &dstGidIndex));
-
-    ERR_CHECK(SetIbvGid(srcRdmaResources->context, port,
-                        srcGidIndex, srcRdmaResources->gid));
-
-    ERR_CHECK(SetIbvGid(dstRdmaResources->context, port,
-                        dstGidIndex,dstRdmaResources->gid));
-  }
-
-  assert(senderQp == nullptr);
-  assert(receiverQp == nullptr);
-  assert(qpCount >= 1);
-  senderQp   = new ibv_qp* [qpCount];
-  receiverQp = new ibv_qp* [qpCount];
-  for(int i = 0; i < qpCount; ++i) {
-    ERR_CHECK(CreateQP(srcRdmaResources->protectionDomain,
-                       srcRdmaResources->completionQueue, senderQp[i]));
-
-    ERR_CHECK(CreateQP(dstRdmaResources->protectionDomain,
-                       dstRdmaResources->completionQueue, receiverQp[i]));
-
-    ERR_CHECK(InitQP(senderQp[i], port, rdmaFlags));
-
-    ERR_CHECK(InitQP(receiverQp[i], port, rdmaFlags));
-
-    ERR_CHECK(TransitionQpToRtr(senderQp[i], dstRdmaResources->portAttr.lid,
-                                receiverQp[i]->qp_num, dstRdmaResources->gid,
-                                dstGidIndex, port, isRoce,
-                                srcRdmaResources->portAttr.active_mtu));
-
-    ERR_CHECK(TransitionQpToRts(senderQp[i]));
-
-    ERR_CHECK(TransitionQpToRtr(receiverQp[i], srcRdmaResources->portAttr.lid,
-                                senderQp[i]->qp_num, srcRdmaResources->gid,
-                                srcGidIndex, port, isRoce,
-                                dstRdmaResources->portAttr.active_mtu));
-
-    ERR_CHECK(TransitionQpToRts(receiverQp[i]));
-  }
-  return ERR_NONE;
-}
-
-static ErrResult RegisterRdmaMemoryTransfer(TransferResources & resources,
-                                            int               & transferId)
-{
-  auto&& srcDeviceId     = resources.srcNic;
-  auto&& dstDeviceId     = resources.dstNic;
-  auto&& qpCount         = resources.qpCount;
-  auto&& srcRdmaResource = resources.rdmaResourceMapper[srcDeviceId];
-  auto&& dstRdmaResource = resources.rdmaResourceMapper[dstDeviceId];
-  struct ibv_mr *src_mr;
-  struct ibv_mr *dst_mr;
-  IBV_PTR_CALL(src_mr, ibv_reg_mr, srcRdmaResource->protectionDomain, resources.srcMem[0],
-               resources.numBytes, rdmaFlags);
-  IBV_PTR_CALL(dst_mr, ibv_reg_mr, dstRdmaResource->protectionDomain, resources.dstMem[0],
-               resources.numBytes, rdmaFlags);
-  resources.sourceMr.push_back(std::make_pair(src_mr, resources.srcMem[0]));
-  resources.destinationMr.push_back(std::make_pair(dst_mr, resources.dstMem[0]));
-  for(int i = 0; i < qpCount; ++i) {
-    resources.receiveStatuses.push_back(false);
-  }
-  resources.messageSizes.push_back(resources.numBytes);
-  transferId = resources.receiveStatuses.size() - qpCount;
-  return ERR_NONE;
-}
-
-static ErrResult TransferRdma(TransferResources & resources,
-                              int               const& transferIdx)
-{
-  int const& qpCount     = resources.qpCount;
-  int const& srcDeviceId = resources.srcNic;
-  assert((transferIdx % qpCount) == 0);
-  uint64_t memIndex = transferIdx / qpCount;
-  auto&& srcRdmaResource = resources.rdmaResourceMapper[srcDeviceId];
-  size_t chunkSize = resources.messageSizes[memIndex] / qpCount;
-  size_t remaining_size = resources.messageSizes[memIndex] % qpCount;
-  for (auto i = 0; i < qpCount; ++i) {
-    struct ibv_sge sg = {};
-    struct ibv_send_wr wr = {};
-    size_t currentChunkSize = chunkSize + (i == qpCount - 1 ? remaining_size : 0);
-    sg.addr = (uint64_t)resources.sourceMr[memIndex].second + i * chunkSize;
-    sg.length = currentChunkSize;
-    sg.lkey = resources.sourceMr[memIndex].first->lkey;
-    struct ibv_send_wr *bad_wr;
-    wr.wr_id = transferIdx + i;
-    assert(wr.wr_id < resources.receiveStatuses.size());
-    wr.sg_list = &sg;
-    wr.num_sge = 1;
-    wr.opcode = IBV_WR_RDMA_WRITE;
-    wr.send_flags = IBV_SEND_SIGNALED;
-    wr.wr.rdma.remote_addr = (uint64_t)resources.destinationMr[memIndex].second + i * chunkSize;
-    wr.wr.rdma.rkey = resources.destinationMr[memIndex].first->rkey;
-    IBV_CALL(ibv_post_send, resources.senderQp[i], &wr, &bad_wr);
-  }
-  for(auto i = 0; i < qpCount; ++i) {
-    ERR_CHECK(PollIbvCQ(srcRdmaResource->completionQueue, transferIdx + i, resources.receiveStatuses));
-  }
-  return ERR_NONE;
-}
-
-static ErrResult TeardownRdma(TransferResources & resources)
-{
-  auto&& sourceMr    = resources.sourceMr;
-  auto&& dstMr       = resources.destinationMr;
-  auto&& senderQp    = resources.senderQp;
-  auto&& receiverQp  = resources.receiverQp;
-  auto&& srcDeviceId = resources.srcNic;
-  auto&& dstDeviceId = resources.dstNic;
-  auto&& qpCount     = resources.qpCount;
-  if (sourceMr.size() > 0) {
-    for(auto mr : sourceMr) {
-      IBV_CALL(ibv_dereg_mr, mr.first);
-    }
-    sourceMr.clear();
-  }
-  if (dstMr.size() > 0) {
-    for(auto mr : dstMr) {
-      IBV_CALL(ibv_dereg_mr, mr.first);
-    }
-    dstMr.clear();
-  }
-  resources.receiveStatuses.clear();
-  resources.messageSizes.clear();
-
-  if (senderQp) {
-    for (int i = 0; i < qpCount; ++i) {
-      IBV_CALL(ibv_destroy_qp, senderQp[i]);
-      senderQp[i] = nullptr;
-    }
-    delete[] senderQp;
-    senderQp = nullptr;
-  }
-  if (receiverQp) {
-    for (int i = 0; i < qpCount; ++i) {
-      IBV_CALL(ibv_destroy_qp, receiverQp[i]);
-      receiverQp[i] = nullptr;
-    }
-    delete[] receiverQp;
-    receiverQp = nullptr;
-  }
-  auto& srcRdmaResource = resources.rdmaResourceMapper[srcDeviceId];
-  auto& dstRdmaResource = resources.rdmaResourceMapper[dstDeviceId];
-
-  if (srcRdmaResource != nullptr) {
-    if (srcRdmaResource->completionQueue) {
-      IBV_CALL(ibv_destroy_cq, srcRdmaResource->completionQueue);
-      srcRdmaResource->completionQueue = nullptr;
-    }
-    if (srcRdmaResource->protectionDomain) {
-      IBV_CALL(ibv_dealloc_pd, srcRdmaResource->protectionDomain);
-      srcRdmaResource->protectionDomain = nullptr;
-    }
-    if (srcRdmaResource->context) {
-      IBV_CALL(ibv_close_device, srcRdmaResource->context);
-      srcRdmaResource->context = nullptr;
-    }
-    srcRdmaResource = nullptr;
-  }
-
-  if (dstRdmaResource != nullptr) {
-    if (dstRdmaResource->completionQueue) {
-      IBV_CALL(ibv_destroy_cq, dstRdmaResource->completionQueue);
-      dstRdmaResource->completionQueue = nullptr;
-    }
-    if (dstRdmaResource->protectionDomain) {
-      IBV_CALL(ibv_dealloc_pd, dstRdmaResource->protectionDomain);
-      dstRdmaResource->protectionDomain = nullptr;
-    }
-    if (dstRdmaResource->context) {
-      IBV_CALL(ibv_close_device, dstRdmaResource->context);
-      dstRdmaResource->context = nullptr;
-    }
-    dstRdmaResource = nullptr;
-  }
-  return ERR_NONE;
-}
-#endif // end of the IBV_EXEC code
 
 // Executor-related functions
 //========================================================================================
