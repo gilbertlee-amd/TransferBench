@@ -1242,7 +1242,7 @@ namespace {
     uint32_t                   xccId;             ///< XCC ID
   };
 
-   // RDMA NIC resource
+  // RDMA NIC resource
 #ifdef NIC_EXEC_ENABLED
   struct NicResources
   {
@@ -1275,7 +1275,7 @@ namespace {
     hsa_amd_sdma_engine_id_t   sdmaEngineId;      ///< DMA engine ID
 #endif
 
- // For IBV executor
+// For IBV executor
 #ifdef NIC_EXEC_ENABLED
     vector<NicResources*> rdmaResourceMapper;    ///< Store resource sensitive RDMA fields
     vector<pair<ibv_mr *, void*>> sourceMr;      ///< Memory region for the source buffer
@@ -1315,7 +1315,7 @@ namespace {
   };
 
 // IB Verbs-related functions
- //========================================================================================
+//========================================================================================
 #ifdef NIC_EXEC_ENABLED
 #define MAX_SEND_WR_PER_QP 12
 #define MAX_RECV_WR_PER_QP 12
@@ -2627,7 +2627,7 @@ static ErrResult TeardownRdma(TransferResources& resources)
                           hipMemcpyHostToDevice));
       ERR_CHECK(hipDeviceSynchronize());
     }
-     if (IsRdmaExeType(exeDevice.exeType)) {
+    if (IsRdmaExeType(exeDevice.exeType)) {
 #ifdef NIC_EXEC_ENABLED
     for (auto& resources : exeInfo.resources) {
       Transfer const& t = transfers[resources.transferIdx];
@@ -2673,7 +2673,7 @@ static ErrResult TeardownRdma(TransferResources& resources)
       if (exeDevice.exeType == EXE_GPU_DMA && (t.exeSubIndex != -1 || cfg.dma.useHsaCopy)) {
         ERR_CHECK(hsa_signal_destroy(resources.signal));
       }
- #endif
+#endif
 #ifdef NIC_EXEC_ENABLED
       if(IsRdmaExeType(exeDevice.exeType)) {
         ERR_CHECK(TeardownRdma(resources));
@@ -3311,7 +3311,7 @@ static ErrResult TeardownRdma(TransferResources& resources)
     switch (exeDevice.exeType) {
     case EXE_CPU:     return RunCpuExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
     case EXE_GPU_GFX: return RunGpuExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
-     case EXE_GPU_DMA: return RunDmaExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
+    case EXE_GPU_DMA: return RunDmaExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
 #ifdef NIC_EXEC_ENABLED
     case EXE_NIC: case EXE_NIC_NEAREST: return RunRdmaExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
 #endif
@@ -3708,7 +3708,7 @@ static ErrResult TeardownRdma(TransferResources& resources)
       hipError_t status = hipGetDeviceCount(&numDetectedGpus);
       if (status != hipSuccess) numDetectedGpus = 0;
       return numDetectedGpus;
-     }
+    }
 #ifdef NIC_EXEC_ENABLED
     case EXE_NIC: case EXE_NIC_NEAREST:
     {
@@ -3823,7 +3823,7 @@ static ErrResult TeardownRdma(TransferResources& resources)
 #endif
   }
   int GetClosestNicToGpu(int gpuIndex)
-   {
+  {
 #ifdef NIC_EXEC_ENABLED
     InitDeviceMappings();
     if(gpuIndex >= _gpuToNicMapper.size() || gpuIndex < 0) {
@@ -3838,7 +3838,7 @@ static ErrResult TeardownRdma(TransferResources& resources)
 
   std::vector<int> GetClosestGpusToNic(int nicIndex)
   {
-     std::vector<int> closestGpus;
+    std::vector<int> closestGpus;
 #ifdef NIC_EXEC_ENABLED
     InitDeviceMappings();
     if(nicIndex >= _nicToGpuMapper.size()) {
