@@ -62,7 +62,7 @@ namespace TransferBench
   using std::set;
   using std::vector;
 
-  constexpr char VERSION[] = "1.57";
+  constexpr char VERSION[] = "1.58";
 
   /**
    * Enumeration of supported Executor types
@@ -1101,7 +1101,7 @@ namespace {
 #endif
         }
 
-        if (!IsGpuMemType(t.srcs[0].memType) || !IsGpuMemType(t.dsts[0].memType)) {
+        if (!IsGpuMemType(t.srcs[0].memType) && !IsGpuMemType(t.dsts[0].memType)) {
           errors.push_back({ERR_WARN,
               "Transfer %d: No GPU memory for source or destination.  Copy might not execute on DMA %d",
               i, t.exeDevice.exeIndex});
@@ -2543,6 +2543,9 @@ static ErrResult TeardownRdma(TransferResources& resources)
 
         // Create HSA completion signal
         ERR_CHECK(hsa_signal_create(1, 0, NULL, &resources.signal));
+
+        if (t.exeSubIndex != -1)
+          resources.sdmaEngineId = (hsa_amd_sdma_engine_id_t)(1U << t.exeSubIndex);
 #endif
       }
 
@@ -3230,7 +3233,7 @@ static ErrResult TeardownRdma(TransferResources& resources)
       // Use HSA async copy
       do {
         hsa_signal_store_screlease(resources.signal, 1);
-        if (cfg.dma.useHsaCopy) {
+        if (!useSubIndices) {
           ERR_CHECK(hsa_amd_memory_async_copy(resources.dstMem[0], resources.dstAgent,
                                               resources.srcMem[0], resources.srcAgent,
                                               resources.numBytes, 0, NULL,
