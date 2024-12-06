@@ -3096,21 +3096,21 @@ static ErrResult InitRdmaTransferResources(RdmaOptions       const& rdmaOptions,
                                            TransferResources&       resources)
 {
   InitDeviceList();
-  auto && port            = rdmaOptions.ibPort;
+  auto&& port            = rdmaOptions.ibPort;
   auto srcGidIndex        = rdmaOptions.ibGidIndex;
   auto dstGidIndex        = rdmaOptions.ibGidIndex;
-  auto && roceVersion     = rdmaOptions.roceVersion;
-  auto && ipAddrFamily    = rdmaOptions.ipAddressFamily;
-  auto && qpCount         = resources.qpCount;
-  auto && srcDeviceId     = resources.srcNic;
-  auto && dstDeviceId     = resources.dstNic;
+  auto&& roceVersion     = rdmaOptions.roceVersion;
+  auto&& ipAddrFamily    = rdmaOptions.ipAddressFamily;
+  auto&& qpCount         = resources.qpCount;
+  auto&& srcDeviceId     = resources.srcNic;
+  auto&& dstDeviceId     = resources.dstNic;
   resources.qpCount       = qpCount;
   ERR_CHECK(InitRdmaResources(srcDeviceId, port, resources.rdmaResourceMapper));
   ERR_CHECK(InitRdmaResources(dstDeviceId, port, resources.rdmaResourceMapper));
-  auto && srcRdmaResources = resources.rdmaResourceMapper[srcDeviceId];
-  auto && dstRdmaResources = resources.rdmaResourceMapper[dstDeviceId];
-  auto && senderQp         = resources.senderQp;
-  auto && receiverQp       = resources.receiverQp;
+  auto&& srcRdmaResources = resources.rdmaResourceMapper[srcDeviceId];
+  auto&& dstRdmaResources = resources.rdmaResourceMapper[dstDeviceId];
+  auto&& senderQp         = resources.senderQp;
+  auto&& receiverQp       = resources.receiverQp;
 
   bool isRoce = srcRdmaResources->portAttr.link_layer == IBV_LINK_LAYER_ETHERNET;
   assert(srcRdmaResources->portAttr.link_layer == dstRdmaResources->portAttr.link_layer);
@@ -3166,11 +3166,11 @@ static ErrResult InitRdmaTransferResources(RdmaOptions       const& rdmaOptions,
 static ErrResult RegisterRdmaMemoryTransfer(TransferResources & resources,
                                             int               & transferId)
 {
-  auto && srcDeviceId     = resources.srcNic;
-  auto && dstDeviceId     = resources.dstNic;
-  auto && qpCount         = resources.qpCount;
-  auto && srcRdmaResource = resources.rdmaResourceMapper[srcDeviceId];
-  auto && dstRdmaResource = resources.rdmaResourceMapper[dstDeviceId];
+  auto&& srcDeviceId     = resources.srcNic;
+  auto&& dstDeviceId     = resources.dstNic;
+  auto&& qpCount         = resources.qpCount;
+  auto&& srcRdmaResource = resources.rdmaResourceMapper[srcDeviceId];
+  auto&& dstRdmaResource = resources.rdmaResourceMapper[dstDeviceId];
   struct ibv_mr *src_mr;
   struct ibv_mr *dst_mr;
   IBV_PTR_CALL(src_mr, ibv_reg_mr, srcRdmaResource->protectionDomain, resources.srcMem[0],
@@ -3194,7 +3194,7 @@ static ErrResult TransferRdma(TransferResources & resources,
   int const& srcDeviceId = resources.srcNic;
   assert((transferIdx % qpCount) == 0);
   uint64_t memIndex = transferIdx / qpCount;
-  auto && srcRdmaResource = resources.rdmaResourceMapper[srcDeviceId];
+  auto&& srcRdmaResource = resources.rdmaResourceMapper[srcDeviceId];
   size_t chunkSize = resources.messageSizes[memIndex] / qpCount;
   size_t remaining_size = resources.messageSizes[memIndex] % qpCount;
   for (auto i = 0; i < qpCount; ++i) {
