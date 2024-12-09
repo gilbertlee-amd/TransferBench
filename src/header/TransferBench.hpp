@@ -1324,10 +1324,10 @@ const unsigned int rdmaFlags = IBV_ACCESS_LOCAL_WRITE    |
                                IBV_ACCESS_REMOTE_WRITE   |
                                IBV_ACCESS_REMOTE_ATOMIC;
 #define IB_PSN  0
-#define INIT_ONCE(flag)\
-  do {                 \
-  if(flag) return;     \
-  else flag = true;    \
+#define INIT_ONCE(flag)         \
+  do {                          \
+  if(flag) return ERR_NONE;     \
+  else flag = true;             \
   } while(0);
 
 const  uint64_t WR_ID = 1789;
@@ -1380,12 +1380,11 @@ public:
 
 static PCIe_tree pcie_root;
 
-static void InsertPCIePathToTree(PCIe_tree* root, const std::string& pcieAddress, const std::string& description)
+static ErrResult InsertPCIePathToTree(PCIe_tree* root, const std::string& pcieAddress, const std::string& description)
 {
   std::filesystem::path devicePath = "/sys/bus/pci/devices/" + pcieAddress;
   if (!std::filesystem::exists(devicePath)) {
-    printf("[ERROR] Device path %s does not exist\n", devicePath.c_str());
-    return;
+    return {ERR_FATAL, "Device path %s does not exist\n", devicePath.c_str()};
   }
   std::string canonicalPath = std::filesystem::canonical(devicePath).string();
   std::istringstream iss(canonicalPath);
@@ -1402,6 +1401,7 @@ static void InsertPCIePathToTree(PCIe_tree* root, const std::string& pcieAddress
     currentNode = const_cast<PCIe_tree*>(&(*it));
   }
   currentNode->description = description;
+  return ERR_NONE;
 }
 
 static const PCIe_tree* getLcaBetweenNodes(const PCIe_tree* root, std::string node1, std::string node2)
@@ -1533,14 +1533,10 @@ static ErrResult InitDeviceList()
   return ERR_NONE;
 }
 
-static void BuildPCIeTree()
+static ErrResult BuildPCIeTree()
 {
   INIT_ONCE(_pcieTreeInit);
-  ErrResult error = InitDeviceList();
-  if(error.errType != ERR_NONE) {
-    printf("Failed to get IB devices list.\n");
-    return;
-  }
+  ERR_CHECK(InitDeviceList());
   _ibDeviceBusIds.resize(_rdmaNicCount, "");
   _nicToGpuMapper.resize(_rdmaNicCount);
   _deviceNames.resize(_rdmaNicCount);
@@ -1550,13 +1546,11 @@ static void BuildPCIeTree()
     _deviceNames[i] = device->name;
     struct ibv_context *context = ibv_open_device(device);
     if (!context) {
-      printf("Failed to open device %s\n", device->name);
       continue;
     }
 
     struct ibv_device_attr deviceAttr;
     if (ibv_query_device(context, &deviceAttr)) {
-      printf("Failed to query device attributes for %s\n", device->name);
       ibv_close_device(context);
       continue;
     }
@@ -1565,7 +1559,6 @@ static void BuildPCIeTree()
     for (int port = 1; port <= deviceAttr.phys_port_cnt; ++port) {
       struct ibv_port_attr portAttr;
       if (ibv_query_port(context, port, &portAttr)) {
-        printf("Failed to query port %d attributes for %s\n", port, device->name);
         continue;
       }
       if (portAttr.state == IBV_PORT_ACTIVE) {
@@ -1587,7 +1580,7 @@ static void BuildPCIeTree()
       if (pos != std::string::npos) {
         std::string nicBusId = pciPath.substr(pos + 1);
         _ibDeviceBusIds[i] = nicBusId;
-        InsertPCIePathToTree(&pcie_root, nicBusId, _deviceNames[i]);
+        ERR_CHECK(InsertPCIePathToTree(&pcie_root, nicBusId, _deviceNames[i]));
       }
     }
   }
@@ -1598,11 +1591,11 @@ static void BuildPCIeTree()
     char hipPciBusId[64];
     hipError_t err = hipDeviceGetPCIBusId(hipPciBusId, sizeof(hipPciBusId), i);
     if (err != hipSuccess) {
-      printf("Failed to get PCI Bus ID for HIP device %d: %s\n", i, hipGetErrorString(err));
-      return;
+      return ErrResult(err);
     }
-    InsertPCIePathToTree(&pcie_root, hipPciBusId, "GPU " + std::to_string(i));
+    ERR_CHECK(InsertPCIePathToTree(&pcie_root, hipPciBusId, "GPU " + std::to_string(i)));
   }
+  return ERR_NONE;
 }
 
 static int GetClosestRdmaNicId(int hipDeviceId)
@@ -1633,10 +1626,10 @@ static int GetClosestRdmaNicId(int hipDeviceId)
   return closestRdmaNicId;
 }
 
-static void InitDeviceMappings()
+static ErrResult InitDeviceMappings()
 {
   INIT_ONCE(_deviceMappingInit);
-  BuildPCIeTree();
+  ERR_CHECK(BuildPCIeTree());
   int gpuCount = GetNumExecutors(EXE_GPU_GFX);
   for (int i = 0; i < gpuCount; ++i) {
     int closestIbDevice = GetClosestRdmaNicId(i);
@@ -1646,6 +1639,7 @@ static void InitDeviceMappings()
       _nicToGpuMapper[closestIbDevice].insert(i);
     }
   }
+  return ERR_NONE;
 }
 
 static void PrintPCIeTree(PCIe_tree   const& node,
@@ -3793,7 +3787,11 @@ static ErrResult TeardownRdma(TransferResources& resources)
   int GetClosestNicToGpu(int gpuIndex)
   {
 #ifdef NIC_EXEC_ENABLED
-    InitDeviceMappings();
+    ErrResult err = InitDeviceMappings();
+    if(err.errType != ERR_NONE) {
+      printf("%s\n", err.errMsg.c_str());
+      return -1;
+    }
     if(gpuIndex >= _gpuToNicMapper.size() || gpuIndex < 0) {
       printf("[Warning] GPU device index %d is out of range. \n", gpuIndex);
       return -1;
@@ -3808,9 +3806,13 @@ static ErrResult TeardownRdma(TransferResources& resources)
   {
     std::vector<int> closestGpus;
 #ifdef NIC_EXEC_ENABLED
-    InitDeviceMappings();
+    ErrResult err = InitDeviceMappings();
+    if(err.errType != ERR_NONE) {
+      printf("%s\n", err.errMsg.c_str());
+      return closestGpus;
+    }
     if(nicIndex >= _nicToGpuMapper.size()) {
-      printf("[Warning] NIC index %d is out of range. No GPUs found.\n", nicIndex);
+      printf("NIC index %d is out of range. No GPUs found.\n", nicIndex);
       return closestGpus;
     }
     for (auto it = _nicToGpuMapper[nicIndex].begin(); it != _nicToGpuMapper[nicIndex].end(); ++it) {
