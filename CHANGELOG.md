@@ -3,6 +3,59 @@
 Documentation for TransferBench is available at
 [https://rocm.docs.amd.com/projects/TransferBench](https://rocm.docs.amd.com/projects/TransferBench).
 
+## v1.58.00
+### Fixed
+- Fixed broken specific DMA-engine copies
+
+## v1.57.01
+### Added
+- Re-added "scaling" GPU GFX preset benchmark, which tests copies from GPU to other devices using varying
+  number of CUs.
+
+## v1.57.00
+### Modified
+- Removing use of default starship operator / C++20 requirement to enable compilation of more OSs
+- Changing how version is reported.  Client version is now just last two digits, and increments only if
+  no changes are made to the backend header-only library file, and resets to 0 when header is updated
+- GFX_SINGLE_TEAM=0 is set by default
+
+## v1.56
+### Fixed
+- Fixed bug when using interactive mode.  Interactive mode now starts prior to all warmup iterations
+
+## v1.55
+### Fixed
+- Fixed missing header error when compiling on CentOS
+- Fixed issues when using multi-stream mode for GFX executor
+
+## v1.54
+### Modified
+- Refactored TransferBench into a header-only library combined with a thin client to facilitate the
+  use of TransferBench as the backend for other applications
+- Optimized how data validation is handled - this should speed up Tests with many parallel transfers as data is only
+  generated once
+- Preset benchmarks now no longer take in any extra command line arguments.  Preset settings are only accessed via
+  environment variables.  Details for each preset are printed
+- The a2a preset benchmark now defaults to using fine-grained memory and GFX unroll of 2
+- Refactored how Transfers are launched in parallel which has reduced some CPU-side overheads
+- CPU and DMA executor timing now use CPU wall clock timing instead of slowest Transfer time
+### Added
+- New one2all preset which sweeps over all subests of parallel transfers from one GPU to others
+- Adding new warnings for DMA execution relating to how HIP will default to using agents from the source memory
+### Removed
+- CU scaling preset has been removed.  Similar functionality already exists in the schmoo preset benchmark
+- Preparation of source data via GFX kernel has been removed (USE_PREP_KERNEL)
+- Removed GFX block-reordering (BLOCK_ORDER)
+- Removed NUM_CPU_DEVICES and NUM_GPU_DEVICES from common env vars and only into the presets they apply to.
+- Removed SHARED_MEM_BYTES option for GFX executor
+- Removed USE_PCIE_INDEX, and SHARED_MEM_BYTES
+### Fixed
+- Fixed a potential timing reporting issue when DMA executed Transfers end up getting serialized.
+
+## v1.53
+### Added
+- Added ability to specify NULL for sweep preset as source or destination memory type
+
 ## v1.52
 ### Added
 - Added USE_HSA_DMA env var to switch to using hsa_amd_memory_async_copy instead of hipMemcpyAsync for DMA execution
