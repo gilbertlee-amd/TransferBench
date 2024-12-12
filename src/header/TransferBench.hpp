@@ -20,6 +20,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 */
 
+/**
 #pragma once
 #include <cstring>
 #include <future>
@@ -41,6 +42,7 @@ THE SOFTWARE.
 #include <hsa/hsa.h>
 #include <hsa/hsa_ext_amd.h>
 #endif
+*/
 
 namespace TransferBench
 {
@@ -118,7 +120,7 @@ namespace TransferBench
    */
   struct Transfer
   {
-    size_t            numBytes    = (1<<26);    ///< # of bytes to Transfer
+    size_t            numBytes    = (1<<26);    ///< Number of bytes to Transfer
     vector<MemDevice> srcs        = {};         ///< List of source memory devices
     vector<MemDevice> dsts        = {};         ///< List of destination memory devices
     ExeDevice         exeDevice   = {};         ///< Executor to use
@@ -132,8 +134,8 @@ namespace TransferBench
    */
   struct GeneralOptions
   {
-    int numIterations      = 10;                ///< # of timed iterations to perform. If negative, run for -numIterations seconds instead
-    int numSubIterations   = 1;                 ///< # of sub-iterations per iteration
+    int numIterations      = 10;                ///< Number of timed iterations to perform. If negative, run for -numIterations seconds instead
+    int numSubIterations   = 1;                 ///< Number of sub-iterations per iteration
     int numWarmups         = 3;                 ///< Number of un-timed warmup iterations to perform
     int recordPerIteration = 0;                 ///< Record per-iteration timing information
     int useInteractive     = 0;                 ///< Pause for user-input before starting transfer loop
@@ -468,8 +470,8 @@ namespace {
   int   constexpr MAX_BLOCKSIZE  = 512;                       // Max threadblock size
   int   constexpr MAX_WAVEGROUPS = MAX_BLOCKSIZE / 64;        // Max wavegroups/warps
   int   constexpr MAX_UNROLL     = 8;                         // Max unroll factor
-  int   constexpr MAX_SRCS       = 8;                         // Max # srcs per Transfer
-  int   constexpr MAX_DSTS       = 8;                         // Max # dsts per Transfer
+  int   constexpr MAX_SRCS       = 8;                         // Max number of srcs per Transfer
+  int   constexpr MAX_DSTS       = 8;                         // Max number of dsts per Transfer
   int   constexpr MEMSET_CHAR    = 75;                        // Value to memset (char)
   float constexpr MEMSET_VAL     = 13323083.0f;               // Value to memset (double)
 
