@@ -1633,6 +1633,31 @@ static int GetClosestRdmaNicId(int hipDeviceId)
   return closestRdmaNicId;
 }
 
+static int GetClosestGpuDeviceId(int IbvDeviceId)
+{
+  BuildPCIeTree();
+  assert(IbvDeviceId < _ibDeviceBusIds.size());
+  auto address = _ibDeviceBusIds[IbvDeviceId];
+  if (address.empty()) return -1;
+  int closestDevice = -1;
+  int minDistance = std::numeric_limits<int>::max();
+  int gpuCount = GetNumExecutors(EXE_GPU_GFX);
+  for (int i = 0; i < gpuCount; ++i) {
+    char hipPciBusId[64];
+    hipError_t err = hipDeviceGetPCIBusId(hipPciBusId, sizeof(hipPciBusId), i);
+    if (err != hipSuccess) {
+      printf("Failed to get PCI Bus ID for HIP device %d: %s\n", i, hipGetErrorString(err));
+      return -1;
+    }
+    int distance = GetBusIdDistance(hipPciBusId, address);
+    if (distance < minDistance && distance >= 0) {
+      minDistance = distance;
+      closestDevice = i;
+    }
+  }
+  return closestDevice;
+}
+
 static void InitDeviceMappings()
 {
   INIT_ONCE(_deviceMappingInit);
@@ -1646,6 +1671,13 @@ static void InitDeviceMappings()
       _nicToGpuMapper[closestIbDevice].insert(i);
     }
   }
+}
+
+static int GetClosestIbDevice(int hipDeviceId)
+{
+  InitDeviceMappings();
+  assert(hipDeviceId < _gpuToNicMapper.size());
+  return _gpuToNicMapper[hipDeviceId];
 }
 
 static void PrintPCIeTree(PCIe_tree   const& node,
