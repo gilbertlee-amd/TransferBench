@@ -20,7 +20,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 */
 
-
+/// @cond
 #pragma once
 #include <cstring>
 #include <future>
@@ -42,7 +42,7 @@ THE SOFTWARE.
 #include <hsa/hsa.h>
 #include <hsa/hsa_ext_amd.h>
 #endif
-
+/// @endcond
 
 namespace TransferBench
 {
