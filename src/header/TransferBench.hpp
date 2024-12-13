@@ -461,6 +461,8 @@ namespace TransferBench
 
 namespace TransferBench
 {
+
+/// @cond
 // Helper functions ('hidden' in anonymous namespace)
 //========================================================================================
 namespace {
@@ -2110,6 +2112,7 @@ namespace {
 
 } // End of anonymous namespace
 //========================================================================================
+/// @endcond
 
   ErrResult::ErrResult(ErrType err) : errType(err), errMsg("") {};
 
