@@ -100,7 +100,7 @@ public:
   int outputToCsv;                   // Output in CSV format
   int samplingFactor;                // Affects how many different values of N are generated (when N set to 0)
 
-  // Rdma options
+  // NIC options
   int ibGidIndex;                    // GID Index for RoCE NICs
   int roceVersion;                   // RoCE version number
   int ipAddressFamily;               // IP Address Famliy
@@ -344,9 +344,12 @@ public:
   void DisplayEnvVars() const
   {
     int numGpuDevices = TransferBench::GetNumExecutors(EXE_GPU_GFX);
-
+    std::string nicSupport = "";
+#if NIC_EXEC_ENABLED
+    nicSupport = " (with NIC support)";
+#endif
     if (!outputToCsv) {
-      printf("TransferBench v%s.%s\n", TransferBench::VERSION, CLIENT_VERSION);
+      printf("TransferBench v%s.%s%s\n", TransferBench::VERSION, CLIENT_VERSION, nicSupport.c_str());
       printf("===============================================================\n");
       if (!hideEnv) printf("[Common]                              (Suppress by setting HIDE_ENV=1)\n");
     }
@@ -508,10 +511,10 @@ public:
     cfg.gfx.useSingleTeam          = gfxSingleTeam;
     cfg.gfx.waveOrder              = gfxWaveOrder;
 
-    cfg.rdma.ibGidIndex            = ibGidIndex;
-    cfg.rdma.ibPort                = ibPort;
-    cfg.rdma.ipAddressFamily       = ipAddressFamily;
-    cfg.rdma.roceVersion           = roceVersion;
+    cfg.nic.ibGidIndex            = ibGidIndex;
+    cfg.nic.ibPort                = ibPort;
+    cfg.nic.ipAddressFamily       = ipAddressFamily;
+    cfg.nic.roceVersion           = roceVersion;
     std::vector<int> closestNics;
     if(closestNicStr != "") {
       std::stringstream ss(closestNicStr);
@@ -525,7 +528,7 @@ public:
           exit(1);
         }
       }
-      cfg.rdma.closestNics = closestNics;
+      cfg.nic.closestNics = closestNics;
     }
     return cfg;
   }
