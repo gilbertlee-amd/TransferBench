@@ -162,12 +162,13 @@ void AllToAllPreset(EnvVars&           ev,
   printf("   %cSTotal     %cActual\n", separator, separator);
 
   double totalBandwidthGpu = 0.0;
-  double minExecutorBandwidth = std::numeric_limits<double>::max();
-  double maxExecutorBandwidth = 0.0;
+  double minActualBandwidth = std::numeric_limits<double>::max();
+  double maxActualBandwidth = 0.0;
   std::vector<double> colTotalBandwidth(numGpus+2, 0.0);
   for (int src = 0; src < numGpus; src++) {
     double rowTotalBandwidth = 0;
-    double executorBandwidth = 0;
+    int    transferCount = 0;
+    double minBandwidth = std::numeric_limits<double>::max();
     printf("GPU %02d", src);
     for (int dst = 0; dst < numGpus; dst++) {
       if (reIndex.count(std::make_pair(src, dst))) {
@@ -176,8 +177,8 @@ void AllToAllPreset(EnvVars&           ev,
         colTotalBandwidth[dst]  += r.avgBandwidthGbPerSec;
         rowTotalBandwidth       += r.avgBandwidthGbPerSec;
         totalBandwidthGpu       += r.avgBandwidthGbPerSec;
-        executorBandwidth        = std::max(executorBandwidth,
-                                            results.exeResults[transfers[transferIdx].exeDevice].avgBandwidthGbPerSec);
+        minBandwidth             = std::min(minBandwidth, r.avgBandwidthGbPerSec);
+        transferCount++;
         printf("%c%8.3f  ", separator, r.avgBandwidthGbPerSec);
       } else {
         printf("%c%8s  ", separator, "N/A");
@@ -189,12 +190,14 @@ void AllToAllPreset(EnvVars&           ev,
       colTotalBandwidth[numGpus]  += r.avgBandwidthGbPerSec;
       rowTotalBandwidth           += r.avgBandwidthGbPerSec;
       totalBandwidthGpu           += r.avgBandwidthGbPerSec;
-      executorBandwidth           += results.exeResults[r.exeDevice].avgBandwidthGbPerSec;
+      minBandwidth                 = std::min(minBandwidth, r.avgBandwidthGbPerSec);
+      transferCount++;
       printf("%c%8.3f  ", separator, r.avgBandwidthGbPerSec);
     }
-    printf("   %c%8.3f   %c%8.3f\n", separator, rowTotalBandwidth, separator, executorBandwidth);
-    minExecutorBandwidth = std::min(minExecutorBandwidth, executorBandwidth);
-    maxExecutorBandwidth = std::max(maxExecutorBandwidth, executorBandwidth);
+    double actualBandwidth = minBandwidth * transferCount;
+    printf("   %c%8.3f   %c%8.3f\n", separator, rowTotalBandwidth, separator, actualBandwidth);
+    minActualBandwidth = std::min(minActualBandwidth, actualBandwidth);
+    maxActualBandwidth = std::max(maxActualBandwidth, actualBandwidth);
     colTotalBandwidth[numGpus+1] += rowTotalBandwidth;
   }
   printf("\nRTotal");
@@ -205,7 +208,7 @@ void AllToAllPreset(EnvVars&           ev,
     printf("%c%8.3f  ", separator, colTotalBandwidth[numGpus]);
   }
   printf("   %c%8.3f   %c%8.3f   %c%8.3f\n", separator, colTotalBandwidth[numGpus+1],
-         separator, minExecutorBandwidth, separator, maxExecutorBandwidth);
+         separator, minActualBandwidth, separator, maxActualBandwidth);
   printf("\n");
 
   printf("Average   bandwidth (GPU Timed): %8.3f GB/s\n", totalBandwidthGpu / transfers.size());
