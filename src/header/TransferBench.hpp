@@ -40,10 +40,10 @@ THE SOFTWARE.
 #include <stdint.h>
 #include <stdbool.h>
 #include <arpa/inet.h>
-#include <assert.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <filesystem>
+#include <fstream>
 #endif
 
 #if defined(__NVCC__)
@@ -202,8 +202,8 @@ namespace TransferBench
     vector<int> closestNics     = {};           ///< Overrides the auto-detected closest NIC per GPU
     int         maxSendWorkReq  = 1;            ///< Maximum number of send work requests per queue pair
     int         maxRecvWorkReq  = 1;            ///< Maximum number of recv work requests per queue pair
-
     int         queueSize       = 100;          ///< Completion queue size
+    int         useNuma         = 1;            ///< Switch to closest numa thread for execution
   };
 
 
@@ -377,7 +377,15 @@ namespace TransferBench
    */
   int GetClosestCpuNumaToGpu(int gpuIndex);
 
- /**
+  /**
+   * Returns the index of the NUMA node closest to the given NIC
+   *
+   * @param[in] nicIndex Index of the NIC to query
+   * @returns NUMA node index closest to the NIC nicIndex, or -1 if unable to detect
+   */
+  int GetClosestCpuNumaToNic(int nicIndex);
+
+  /**
    * Returns the index of the NIC closest to the given GPU
    *
    * @param[in] gpuIndex Index of the GPU to query
@@ -1248,7 +1256,6 @@ namespace {
       }
     }
 
-
     // Check for fatal errors
     for (auto const& err : errors)
       if (err.errType == ERR_FATAL) return true;
@@ -1289,6 +1296,7 @@ namespace {
     vector<float*>             dstMem;            ///< Destination memory
     vector<SubExecParam>       subExecParamCpu;   ///< Defines subarrays for each subexecutor
     vector<int>                subExecIdx;        ///< Indices into subExecParamGpu
+    int                        numaNode;          ///< NUMA node to use for this Transfer
 
     // For GFX executor
     SubExecParam*              subExecParamGpuPtr;
@@ -1338,7 +1346,6 @@ namespace {
     int                        totalSubExecs;     ///< Total number of subExecutors to use
     bool                       useSubIndices;     ///< Use subexecutor indicies
     int                        numSubIndices;     ///< Number of subindices this ExeDevice has
-    int                        wallClockRate;     ///< (GFX-only) Device wall clock rate
     vector<SubExecParam>       subExecParamCpu;   ///< Subexecutor parameters for this executor
     vector<TransferResources>  resources;         ///< Per-Transfer resources
 
@@ -1347,6 +1354,7 @@ namespace {
     vector<hipStream_t>        streams;           ///< HIP streams to launch on
     vector<hipEvent_t>         startEvents;       ///< HIP start timing event
     vector<hipEvent_t>         stopEvents;        ///< HIP stop timing event
+    int                        wallClockRate;     ///< (GFX-only) Device wall clock rate
   };
 
   // Structure to track PCIe topology
@@ -1377,14 +1385,10 @@ namespace {
   struct IbvDevice
   {
     ibv_device* devicePtr;
-    ibv_pd*                    protectionDomain;  ///< Protection domain for RDMA operations
-    ibv_cq*                    completionQueue;   ///< Completion queue for RDMA operations
-    ibv_context*               context;           ///< Device context for the RDMA capable NIC
-    ibv_port_attr              portAttr;          ///< Port attributes for the RDMA capable NIC
-    ibv_gid                    gid;               ///< GID handler
     std::string name;
     std::string busId;
     bool        hasActivePort;
+    int         numaNode;
   };
 #endif
 
@@ -1435,6 +1439,23 @@ namespace {
               if (pos != std::string::npos) {
                 ibvDevice.busId = pciPath.substr(pos + 1);
               }
+            }
+          }
+
+          // Get nearest numa node for this device
+          ibvDevice.numaNode = -1;
+          std::filesystem::path devicePath = "/sys/bus/pci/devices/" + ibvDevice.busId + "/numa_node";
+          std::string canonicalPath = std::filesystem::canonical(devicePath).string();
+
+          if (std::filesystem::exists(canonicalPath)) {
+            std::ifstream file(canonicalPath);
+            if (file.is_open()) {
+              std::string numaNodeStr;
+              std::getline(file, numaNodeStr);
+              int numaNodeVal;
+              if (sscanf(numaNodeStr.c_str(), "%d", &numaNodeVal) == 1)
+                ibvDevice.numaNode = numaNodeVal;
+              file.close();
             }
           }
           ibvDeviceList.push_back(ibvDevice);
@@ -1955,6 +1976,11 @@ namespace {
                                                TransferResources&   rss)
 
   {
+    // Switch to the closest NUMA node to this NIC
+    int numaNode = GetIbvDeviceList()[srcExeDevice.exeIndex].numaNode;
+    if (numaNode != -1)
+      numa_run_on_node(numaNode);
+
     int const port = cfg.nic.ibPort;
 
     // Figure out destination NIC (Accounts for possible remap due to use of EXE_NIC_NEAREST)
@@ -1975,6 +2001,8 @@ namespace {
       return {ERR_FATAL, "SRC NIC %d is not active\n", rss.srcNicIndex};
     if (!GetIbvDeviceList()[rss.dstNicIndex].hasActivePort)
       return {ERR_FATAL, "DST NIC %d is not active\n", rss.dstNicIndex};
+
+
 
     // Queue pair flags
     const unsigned int rdmaFlags = (IBV_ACCESS_LOCAL_WRITE    |
@@ -2592,26 +2620,29 @@ namespace {
 
 #ifdef NIC_EXEC_ENABLED
   // Execution of a single NIC Transfer
-  static void ExecuteNicTransfer(int           const  iteration,
-                                 ConfigOptions const& cfg,
-                                 int           const  exeIndex,
-                                 TransferResources&   rss,
-                                 ErrResult&           result)
+  static ErrResult ExecuteNicTransfer(int           const  iteration,
+                                      ConfigOptions const& cfg,
+                                      int           const  exeIndex,
+                                      TransferResources&   rss)
   {
     auto cpuStart = std::chrono::high_resolution_clock::now();
 
-    result = {ERR_NONE, ""};
+    // Switch to the closest NUMA node to this NIC
+    if (cfg.nic.useNuma) {
+      int numaNode = GetIbvDeviceList()[exeIndex].numaNode;
+      if (numaNode != -1)
+        numa_run_on_node(numaNode);
+    }
+
     std::vector<ibv_send_wr*> bad_wr(rss.qpCount, nullptr);
     int subIteration = 0;
-
     do {
       // Loop over each of the queue pairs and post the send
       for (int qpIndex = 0; qpIndex < rss.qpCount; qpIndex++) {
         int error = ibv_post_send(rss.srcQueuePairs[qpIndex], &rss.sendWorkRequests[qpIndex], &bad_wr[qpIndex]);
-        if (error) {
-          result = {ERR_FATAL, "Transfer %d: Error when calling ibv_post_send for QP %d\n", rss.transferIdx, qpIndex};
-          return;
-        }
+        if (error)
+          return {ERR_FATAL, "Transfer %d: Error when calling ibv_post_send for QP %d Error code %d\n",
+            rss.transferIdx, qpIndex, error};
       }
 
       // Poll the completion queue until all queue pairs are complete
@@ -2623,11 +2654,10 @@ namespace {
         if (nc > 0) {
           numComplete++;
           if (wc.status != IBV_WC_SUCCESS) {
-            result = {ERR_FATAL, "Transfer %d: Received unsuccessful work completion", rss.transferIdx};
-            return;
+            return {ERR_FATAL, "Transfer %d: Received unsuccessful work completion", rss.transferIdx};
           }
         } else if (nc < 0) {
-          result = {ERR_FATAL, "Transfer %d: Received negative work completion", rss.transferIdx};
+          return {ERR_FATAL, "Transfer %d: Received negative work completion", rss.transferIdx};
         }
       }
     } while (++subIteration != cfg.general.numSubIterations);
@@ -2640,6 +2670,7 @@ namespace {
       if (cfg.general.recordPerIteration)
         rss.perIterMsec.push_back(deltaMsec);
     }
+    return ERR_NONE;
   }
 
   // Execution of a single NIC executor
@@ -2648,27 +2679,25 @@ namespace {
                                   int           const  exeIndex,
                                   ExeInfo&             exeInfo)
   {
+    vector<std::future<ErrResult>> asyncTransfers;
+
     auto cpuStart = std::chrono::high_resolution_clock::now();
-    vector<ErrResult> results(exeInfo.resources.size(), ERR_NONE);
-    vector<std::thread> asyncTransfers;
     for (int i = 0; i < exeInfo.resources.size(); i++) {
-      asyncTransfers.emplace_back(std::thread(ExecuteNicTransfer,
-                                              iteration,
-                                              std::cref(cfg),
-                                              exeIndex,
-                                              std::ref(exeInfo.resources[i]),
-                                              std::ref(results[i])));
+      asyncTransfers.emplace_back(std::async(std::launch::async,
+                                             ExecuteNicTransfer,
+                                             iteration,
+                                             std::cref(cfg),
+                                             exeIndex,
+                                             std::ref(exeInfo.resources[i])));
     }
     for (auto& asyncTransfer : asyncTransfers)
-      asyncTransfer.join();
+      ERR_CHECK(asyncTransfer.get());
 
     auto cpuDelta = std::chrono::high_resolution_clock::now() - cpuStart;
     double deltaMsec = std::chrono::duration_cast<std::chrono::duration<double>>(cpuDelta).count() * 1000.0;
+
     if (iteration >= 0)
       exeInfo.totalDurationMsec += deltaMsec;
-
-    for (auto error : results)
-      if (error.errType != ERR_NONE) return error;
 
     return ERR_NONE;
   }
@@ -3349,7 +3378,7 @@ namespace {
     results.numTimedIterations = numTimedIterations;
     results.totalBytesTransferred = 0;
     results.avgTotalDurationMsec = (totalCpuTimeSec * 1000.0) / (numTimedIterations * cfg.general.numSubIterations);
-    results.overheadMsec = 0.0;
+    results.overheadMsec = results.avgTotalDurationMsec;
     for (auto& exeInfoPair : executorMap) {
       ExeDevice const& exeDevice = exeInfoPair.first;
       ExeInfo&         exeInfo   = exeInfoPair.second;
@@ -3357,12 +3386,12 @@ namespace {
       // Copy over executor results
       ExeResult& exeResult = results.exeResults[exeDevice];
       exeResult.numBytes = exeInfo.totalBytes;
-      exeResult.avgDurationMsec = exeInfo.totalDurationMsec / numTimedIterations;
+      exeResult.avgDurationMsec = exeInfo.totalDurationMsec / (numTimedIterations * cfg.general.numSubIterations);
       exeResult.avgBandwidthGbPerSec = (exeResult.numBytes / 1.0e6) /  exeResult.avgDurationMsec;
       exeResult.sumBandwidthGbPerSec = 0.0;
       exeResult.transferIdx.clear();
       results.totalBytesTransferred += exeInfo.totalBytes;
-      results.overheadMsec = std::max(results.overheadMsec, (results.avgTotalDurationMsec -
+      results.overheadMsec = std::min(results.overheadMsec, (results.avgTotalDurationMsec -
                                                              exeResult.avgDurationMsec));
 
       // Copy over transfer results
@@ -3609,6 +3638,18 @@ namespace {
     return -1;
 #endif
   }
+
+  int GetClosestCpuNumaToNic(int nicIndex)
+  {
+#ifdef NIC_EXEC_ENABLED
+    int numNics = GetNumExecutors(EXE_NIC);
+    if (nicIndex < 0 || nicIndex >= numNics) return -1;
+    return GetIbvDeviceList()[nicIndex].numaNode;
+#else
+    return -1;
+#endif
+  }
+
 
   int GetClosestNicToGpu(int gpuIndex)
   {

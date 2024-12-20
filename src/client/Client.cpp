@@ -222,7 +222,7 @@ void PrintResults(EnvVars const& ev, int const testNum,
     ExeType const    exeType   = exeDevice.exeType;
     int32_t const    exeIndex  = exeDevice.exeIndex;
 
-    printf(" Executor: %3s %02d %c %7.3f GB/s %c %8.3f ms %c %12lu bytes %c %-7.3f GB/s (sum)\n",
+    printf(" Executor: %3s %02d %c %8.3f GB/s %c %8.3f ms %c %12lu bytes %c %-7.3f GB/s (sum)\n",
            ExeTypeName[exeType], exeIndex, sep, exeResult.avgBandwidthGbPerSec, sep,
            exeResult.avgDurationMsec, sep, exeResult.numBytes, sep, exeResult.sumBandwidthGbPerSec);
 
@@ -234,7 +234,7 @@ void PrintResults(EnvVars const& ev, int const testNum,
       char exeSubIndexStr[32] = "";
       if (t.exeSubIndex != -1)
         sprintf(exeSubIndexStr, ".%d", t.exeSubIndex);
-      printf("     Transfer %02d  %c %7.3f GB/s %c %8.3f ms %c %12lu bytes %c %s -> %c%03d%s:%03d -> %s\n",
+      printf("     Transfer %02d  %c %8.3f GB/s %c %8.3f ms %c %12lu bytes %c %s -> %c%03d%s:%03d -> %s\n",
              idx,                    sep,
              r.avgBandwidthGbPerSec, sep,
              r.avgDurationMsec,      sep,
@@ -274,7 +274,7 @@ void PrintResults(EnvVars const& ev, int const testNum,
         for (auto& time : times) {
           double iterDurationMsec = time.first;
           double iterBandwidthGbs = (t.numBytes / 1.0E9) / iterDurationMsec * 1000.0f;
-          printf("      Iter %03d    %c %7.3f GB/s %c %8.3f ms %c", time.second, sep, iterBandwidthGbs, sep, iterDurationMsec, sep);
+          printf("      Iter %03d    %c %8.3f GB/s %c %8.3f ms %c", time.second, sep, iterBandwidthGbs, sep, iterDurationMsec, sep);
 
           std::set<int> usedXccs;
           if (time.second - 1 < r.perIterCUs.size()) {
@@ -290,11 +290,11 @@ void PrintResults(EnvVars const& ev, int const testNum,
             printf(" %02d", x);
           printf("\n");
         }
-        printf("      StandardDev %c %7.3f GB/s %c %8.3f ms %c\n", sep, stdDevBw, sep, stdDevTime, sep);
+        printf("      StandardDev %c %8.3f GB/s %c %8.3f ms %c\n", sep, stdDevBw, sep, stdDevTime, sep);
       }
     }
   }
-  printf(" Aggregate (CPU)  %c %7.3f GB/s %c %8.3f ms %c %12lu bytes %c Overhead: %.3f ms\n",
+  printf(" Aggregate (CPU)  %c %8.3f GB/s %c %8.3f ms %c %12lu bytes %c Overhead: %.3f ms\n",
          sep, results.avgTotalBandwidthGbPerSec,
          sep, results.avgTotalDurationMsec,
          sep, results.totalBytesTransferred,

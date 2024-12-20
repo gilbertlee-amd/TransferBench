@@ -184,18 +184,17 @@ void AllToAllPreset(EnvVars&           ev,
       }
     }
 
-    double nicBandwidth = 0.0;
     if (numQueuePairs > 0) {
       TransferBench::TransferResult const& r = results.tfrResults[nicTransferIdx[src]];
       colTotalBandwidth[numGpus]  += r.avgBandwidthGbPerSec;
       rowTotalBandwidth           += r.avgBandwidthGbPerSec;
       totalBandwidthGpu           += r.avgBandwidthGbPerSec;
+      executorBandwidth           += results.exeResults[r.exeDevice].avgBandwidthGbPerSec;
       printf("%c%8.3f  ", separator, r.avgBandwidthGbPerSec);
-      nicBandwidth = r.avgBandwidthGbPerSec;
     }
-    printf("   %c%8.3f   %c%8.3f\n", separator, rowTotalBandwidth, separator, executorBandwidth + nicBandwidth);
-    minExecutorBandwidth = std::min(minExecutorBandwidth, executorBandwidth + nicBandwidth);
-    maxExecutorBandwidth = std::max(maxExecutorBandwidth, executorBandwidth + nicBandwidth);
+    printf("   %c%8.3f   %c%8.3f\n", separator, rowTotalBandwidth, separator, executorBandwidth);
+    minExecutorBandwidth = std::min(minExecutorBandwidth, executorBandwidth);
+    maxExecutorBandwidth = std::max(maxExecutorBandwidth, executorBandwidth);
     colTotalBandwidth[numGpus+1] += rowTotalBandwidth;
   }
   printf("\nRTotal");
