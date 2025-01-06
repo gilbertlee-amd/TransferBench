@@ -19,7 +19,8 @@ trigger:
     exclude:
     - .github
     - docs
-    - '.*.y*ml'
+    - '.*.yaml'
+    - '.*.yml'
     - '*.md'
     - LICENSE
 
@@ -33,7 +34,8 @@ pr:
     exclude:
     - .github
     - docs
-    - '.*.y*ml'
+    - '.*.yaml'
+    - '.*.yml'
     - '*.md'
     - LICENSE
   drafts: false
