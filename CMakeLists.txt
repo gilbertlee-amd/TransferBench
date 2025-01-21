@@ -7,7 +7,7 @@ else()
 endif()
 cmake_minimum_required(VERSION 3.5)
 
-project(TransferBench VERSION 1.58.00 LANGUAGES CXX)
+project(TransferBench VERSION 1.59.00 LANGUAGES CXX)
 
 # Default GPU architectures to build
 #==================================================================================================
@@ -56,6 +56,18 @@ set( CMAKE_CXX_FLAGS "${flags_str} ${CMAKE_CXX_FLAGS}")
 
 set( CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -L${ROCM_PATH}/lib")
 include_directories(${ROCM_PATH}/include)
+find_library(IBVERBS_LIBRARY ibverbs)
+if (IBVERBS_LIBRARY)
+    if (DEFINED ENV{DISABLE_NIC_EXEC})
+        message(STATUS "Disabling NIC Executor support")
+    else()
+        message(STATUS "Found ibverbs: ${IBVERBS_LIBRARY}.  Building with NIC executor support. Can set DISABLE_NIC_EXEC=1 to disable")
+        add_definitions(-DNIC_EXEC_ENABLED)
+        link_libraries(ibverbs)
+    endif()
+else()
+    message(WARNING "IBVerbs library not found.  Building without NIC executor support")
+endif()
 link_libraries(numa hsa-runtime64 pthread)
 set (CMAKE_RUNTIME_OUTPUT_DIRECTORY .)
 add_executable(TransferBench src/client/Client.cpp)
