@@ -64,7 +64,7 @@ namespace TransferBench
   using std::set;
   using std::vector;
 
-  constexpr char VERSION[] = "1.59";
+  constexpr char VERSION[] = "1.59HACK";
 
   /**
    * Enumeration of supported Executor types
@@ -2704,6 +2704,8 @@ namespace {
   // Helper function for memset
   template <typename T> __device__ __forceinline__ T      MemsetVal();
   template <>           __device__ __forceinline__ float  MemsetVal(){ return MEMSET_VAL; };
+  template <>           __device__ __forceinline__ float2 MemsetVal(){ return make_float2(MEMSET_VAL,
+                                                                                          MEMSET_VAL); }
   template <>           __device__ __forceinline__ float4 MemsetVal(){ return make_float4(MEMSET_VAL,
                                                                                           MEMSET_VAL,
                                                                                           MEMSET_VAL,
@@ -2839,15 +2841,144 @@ namespace {
     }
   }
 
+    template <int BLOCKSIZE, int UNROLL>
+  __global__ void __launch_bounds__(BLOCKSIZE)
+    GpuReduceKernel2(SubExecParam* params, int waveOrder, int numSubIterations)
+  {
+    int64_t startCycle;
+    if (threadIdx.x == 0) startCycle = GetTimestamp();
+
+    SubExecParam& p = params[blockIdx.y];
+
+    // Filter by XCC
+#if !defined(__NVCC__)
+    int32_t xccId;
+    GetXccId(xccId);
+    if (p.preferredXccId != -1 && xccId != p.preferredXccId) return;
+#endif
+
+    // Collect data information
+    int32_t const  numSrcs  = p.numSrcs;
+    int32_t const  numDsts  = p.numDsts;
+    float2  const* __restrict__ srcFloat2[MAX_SRCS];
+    float2*        __restrict__ dstFloat2[MAX_DSTS];
+    for (int i = 0; i < numSrcs; i++) srcFloat2[i] = (float2*)p.src[i];
+    for (int i = 0; i < numDsts; i++) dstFloat2[i] = (float2*)p.dst[i];
+
+    // Operate on wavefront granularity
+    int32_t const nTeams   = p.teamSize;             // Number of threadblocks working together on this subarray
+    int32_t const teamIdx  = p.teamIdx;              // Index of this threadblock within the team
+    int32_t const nWaves   = BLOCKSIZE   / warpSize; // Number of wavefronts within this threadblock
+    int32_t const waveIdx  = threadIdx.x / warpSize; // Index of this wavefront within the threadblock
+    int32_t const tIdx     = threadIdx.x % warpSize; // Thread index within wavefront
+
+    size_t  const numFloat2 = p.N / 2;
+
+    int32_t teamStride, waveStride, unrlStride, teamStride2, waveStride2;
+    switch (waveOrder) {
+    case 0: /* U,W,C */ unrlStride = 1; waveStride = UNROLL; teamStride = UNROLL * nWaves;  teamStride2 = nWaves; waveStride2 = 1     ; break;
+    case 1: /* U,C,W */ unrlStride = 1; teamStride = UNROLL; waveStride = UNROLL * nTeams;  teamStride2 = 1;      waveStride2 = nTeams; break;
+    case 2: /* W,U,C */ waveStride = 1; unrlStride = nWaves; teamStride = nWaves * UNROLL;  teamStride2 = nWaves; waveStride2 = 1     ; break;
+    case 3: /* W,C,U */ waveStride = 1; teamStride = nWaves; unrlStride = nWaves * nTeams;  teamStride2 = nWaves; waveStride2 = 1     ; break;
+    case 4: /* C,U,W */ teamStride = 1; unrlStride = nTeams; waveStride = nTeams * UNROLL;  teamStride2 = 1;      waveStride2 = nTeams; break;
+    case 5: /* C,W,U */ teamStride = 1; waveStride = nTeams; unrlStride = nTeams * nWaves;  teamStride2 = 1;      waveStride2 = nTeams; break;
+    }
+
+    int subIterations = 0;
+    while (1) {
+      // First loop: Each wavefront in the team works on UNROLL float2s per thread
+      size_t const loop1Stride = nTeams * nWaves * UNROLL * warpSize;
+      size_t const loop1Limit  = numFloat2 / loop1Stride * loop1Stride;
+      {
+        float2 val[UNROLL];
+        if (numSrcs == 0) {
+          #pragma unroll
+          for (int u = 0; u < UNROLL; u++)
+            val[u] = MemsetVal<float2>();
+        }
+
+        for (size_t idx = (teamIdx * teamStride + waveIdx * waveStride) * warpSize + tIdx; idx < loop1Limit; idx += loop1Stride) {
+          // Read sources into memory and accumulate in registers
+          if (numSrcs) {
+            for (int u = 0; u < UNROLL; u++)
+              val[u] = srcFloat2[0][idx + u * unrlStride * warpSize];
+            for (int s = 1; s < numSrcs; s++)
+              for (int u = 0; u < UNROLL; u++)
+                val[u] += srcFloat2[s][idx + u * unrlStride * warpSize];
+          }
+
+          // Write accumulation to all outputs
+          for (int d = 0; d < numDsts; d++) {
+            #pragma unroll
+            for (int u = 0; u < UNROLL; u++)
+              dstFloat2[d][idx + u * unrlStride * warpSize] = val[u];
+          }
+        }
+      }
+
+      // Second loop: Deal with remaining float2s
+      {
+        if (loop1Limit < numFloat2) {
+          float2 val;
+          if (numSrcs == 0) val = MemsetVal<float2>();
+
+          size_t const loop2Stride = nTeams * nWaves * warpSize;
+          for (size_t idx = loop1Limit + (teamIdx * teamStride2 + waveIdx * waveStride2) * warpSize + tIdx;
+               idx < numFloat2; idx += loop2Stride) {
+            if (numSrcs) {
+              val = srcFloat2[0][idx];
+              for (int s = 1; s < numSrcs; s++)
+                val += srcFloat2[s][idx];
+            }
+            for (int d = 0; d < numDsts; d++)
+              dstFloat2[d][idx] = val;
+          }
+        }
+      }
+
+      // Third loop; Deal with remaining floats
+      {
+        if (numFloat2 * 2 < p.N) {
+          float val;
+          if (numSrcs == 0) val = MemsetVal<float>();
+
+          size_t const loop3Stride = nTeams * nWaves * warpSize;
+          for ( size_t idx = numFloat2 * 2 + (teamIdx * teamStride2 + waveIdx * waveStride2) * warpSize + tIdx; idx < p.N; idx += loop3Stride) {
+            if (numSrcs) {
+              val = p.src[0][idx];
+              for (int s = 1; s < numSrcs; s++)
+                val += p.src[s][idx];
+            }
+
+            for (int d = 0; d < numDsts; d++)
+              p.dst[d][idx] = val;
+          }
+        }
+      }
+
+      if (++subIterations == numSubIterations) break;
+    }
+
+    // Wait for all threads to finish
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      __threadfence_system();
+      p.stopCycle  = GetTimestamp();
+      p.startCycle = startCycle;
+      GetHwId(p.hwId);
+      GetXccId(p.xccId);
+    }
+  }
+
 #define GPU_KERNEL_UNROLL_DECL(BLOCKSIZE)   \
-    {GpuReduceKernel<BLOCKSIZE, 1>,         \
-     GpuReduceKernel<BLOCKSIZE, 2>,         \
-     GpuReduceKernel<BLOCKSIZE, 3>,         \
-     GpuReduceKernel<BLOCKSIZE, 4>,         \
-     GpuReduceKernel<BLOCKSIZE, 5>,         \
-     GpuReduceKernel<BLOCKSIZE, 6>,         \
-     GpuReduceKernel<BLOCKSIZE, 7>,         \
-     GpuReduceKernel<BLOCKSIZE, 8>}
+    {GpuReduceKernel2<BLOCKSIZE, 1>,         \
+     GpuReduceKernel2<BLOCKSIZE, 2>,         \
+     GpuReduceKernel2<BLOCKSIZE, 3>,         \
+     GpuReduceKernel2<BLOCKSIZE, 4>,         \
+     GpuReduceKernel2<BLOCKSIZE, 5>,         \
+     GpuReduceKernel2<BLOCKSIZE, 6>,         \
+     GpuReduceKernel2<BLOCKSIZE, 7>,         \
+     GpuReduceKernel2<BLOCKSIZE, 8>}
 
   // Table of all GPU Reduction kernel functions (templated blocksize / unroll)
   typedef void (*GpuKernelFuncPtr)(SubExecParam*, int, int);
