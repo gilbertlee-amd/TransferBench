@@ -88,6 +88,7 @@ public:
   int gfxBlockSize;                  // Size of each threadblock (must be multiple of 64)
   vector<uint32_t> cuMask;           // Bit-vector representing the CU mask
   vector<vector<int>> prefXccTable;  // Specifies XCC to use for given exe->dst pair
+  int gfxNumPasses;                  // Number of passes for first stage of copy algorithm
   int gfxUnroll;                     // GFX-kernel unroll factor
   int useHipEvents;                  // Use HIP events for timing GFX/DMA Executor
   int useSingleStream;               // Use a single stream per GPU GFX executor instead of stream per Transfer
@@ -139,6 +140,7 @@ public:
     gfxBlockOrder     = GetEnvVar("GFX_BLOCK_ORDER"     , 0);
     gfxBlockSize      = GetEnvVar("GFX_BLOCK_SIZE"      , 256);
     gfxSingleTeam     = GetEnvVar("GFX_SINGLE_TEAM"     , 1);
+    gfxNumPasses      = GetEnvVar("GFX_NUM_PASSES"      , 1);
     gfxUnroll         = GetEnvVar("GFX_UNROLL"          , defaultGfxUnroll);
     gfxWaveOrder      = GetEnvVar("GFX_WAVE_ORDER"      , 0);
     hideEnv           = GetEnvVar("HIDE_ENV"            , 0);
@@ -303,6 +305,7 @@ public:
     printf(" FILL_PATTERN      - Big-endian pattern for source data, specified in hex digits. Must be even # of digits\n");
     printf(" GFX_BLOCK_ORDER   - How blocks for transfers are ordered. 0=sequential, 1=interleaved\n");
     printf(" GFX_BLOCK_SIZE    - # of threads per threadblock (Must be multiple of 64)\n");
+    printf(" GFX_NUM_PASSES    - Number of passes in first stage of GFX copy kernel\n");
     printf(" GFX_UNROLL        - Unroll factor for GFX kernel (0=auto), must be less than %d\n", TransferBench::GetIntAttribute(ATR_GFX_MAX_UNROLL));
     printf(" GFX_SINGLE_TEAM   - Have subexecutors work together on full array instead of working on disjoint subarrays\n");
     printf(" GFX_WAVE_ORDER    - Stride pattern for GFX kernel (0=UWC,1=UCW,2=WUC,3=WCU,4=CUW,5=CWU)\n");
@@ -393,6 +396,7 @@ public:
     Print("GFX_SINGLE_TEAM", gfxSingleTeam,
           "%s", (gfxSingleTeam ? "Combining CUs to work across entire data array" :
                                  "Each CUs operates on its own disjoint subarray"));
+    Print("GFX_NUM_PASSES", gfxNumPasses, "Performing %d pass(es) through first stage of copy kernel", gfxNumPasses);
     Print("GFX_UNROLL", gfxUnroll,
           "Using GFX unroll factor of %d", gfxUnroll);
     Print("GFX_WAVE_ORDER", gfxWaveOrder,
@@ -533,6 +537,7 @@ public:
     cfg.gfx.blockSize              = gfxBlockSize;
     cfg.gfx.cuMask                 = cuMask;
     cfg.gfx.prefXccTable           = prefXccTable;
+    cfg.gfx.numPasses              = gfxNumPasses;
     cfg.gfx.unrollFactor           = gfxUnroll;
     cfg.gfx.useHipEvents           = useHipEvents;
     cfg.gfx.useMultiStream         = !useSingleStream;
