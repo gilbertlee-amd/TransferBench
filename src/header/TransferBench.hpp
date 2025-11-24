@@ -2349,12 +2349,55 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
                                                TransferResources&   rss)
 
   {
+    // Check if on this node, assuming only 1 src-dst pair per transfer
+// not sure what executor maps look like when multiple node sendrecv to self
+    int srcRank = t.srcs[0].memRank;
+    int dstRank = t.dsts[0].memRank;
+    int isSrc = srcRank == GetRank();
+    int isDst = dstRank == GetRank();
+    //                       Rely root to forward send/recv
+    if (!isSrc && !isDst && !GetRank())
+      return ERR_NONE;
+
+    struct __attribute__((packed)) ConnInfo {
+      uint64_t remote_addr;
+      uint32_t rkey;
+      uint16_t lid;
+      uint32_t qpn;
+      // only if roce?
+      // assuming GID index is globally uniform
+      ibv_gid  gid;
+    };
+
+    // If not rank 0, redirect send/receive SRC/DST
+    // Ok to set both to 0, because a rank participating transfer at this time only use one of the variable
+    if (GetRank()) {
+      dstRank = 0;
+      srcRank = 0;
+      // If is both SRC and DST no remote transfer happens and this has no impact
+    } else {
+      if (!isSrc && !isDst) {
+        ConnInfo InfoDtoS, InfoStoD;
+        System::Get().RecvData(dstRank, sizeof(ConnInfo), &InfoDtoS);
+        System::Get().SendData(srcRank, sizeof(ConnInfo), &InfoDtoS);
+        System::Get().RecvData(srcRank, sizeof(ConnInfo), &InfoStoD);
+        System::Get().SendData(dstRank, sizeof(ConnInfo), &InfoStoD);
+      }
+      // Otherwise no forwarding or adjustment to SRC/DST rank is needed
+    }
+
+// unsure if necessary ?
     // Switch to the closest NUMA node to this NIC
     int numaNode = GetIbvDeviceList()[srcExeDevice.exeIndex].numaNode;
     if (numaNode != -1)
       numa_run_on_node(numaNode);
 
     int const port = cfg.nic.ibPort;
+    bool isRoCE = false;
+    // Prepare GID index
+    // CONFIG NEEDS TO BE CONSISTENT
+    int srcGidIndex = cfg.nic.ibGidIndex;
+    int dstGidIndex = cfg.nic.ibGidIndex;
 
     // Figure out destination NIC (Accounts for possible remap due to use of EXE_NIC_NEAREST)
     ExeDevice dstExeDevice;
@@ -2364,15 +2407,17 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     rss.dstNicIndex = dstExeDevice.exeIndex;
     rss.qpCount     = t.numSubExecs;
 
+// line 1546
+// lift this section up in TranferError, should have already been checked ?
     // Check for valid NICs and active ports
     int numNics = GetNumExecutors(EXE_NIC);
-    if (rss.srcNicIndex < 0 || rss.srcNicIndex >= numNics)
+    if (isSrc && (rss.srcNicIndex < 0 || rss.srcNicIndex >= numNics))
       return {ERR_FATAL, "SRC NIC index is out of range (%d)", rss.srcNicIndex};
-    if (rss.dstNicIndex < 0 || rss.dstNicIndex >= numNics)
+    if (isDst && (rss.dstNicIndex < 0 || rss.dstNicIndex >= numNics))
       return {ERR_FATAL, "DST NIC index is out of range (%d)", rss.dstNicIndex};
-    if (!GetIbvDeviceList()[rss.srcNicIndex].hasActivePort)
+    if (isSrc && (!GetIbvDeviceList()[rss.srcNicIndex].hasActivePort))
       return {ERR_FATAL, "SRC NIC %d is not active\n", rss.srcNicIndex};
-    if (!GetIbvDeviceList()[rss.dstNicIndex].hasActivePort)
+    if (isDst && (!GetIbvDeviceList()[rss.dstNicIndex].hasActivePort))
       return {ERR_FATAL, "DST NIC %d is not active\n", rss.dstNicIndex};
 
     // Queue pair flags
@@ -2381,102 +2426,156 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
                                     IBV_ACCESS_REMOTE_WRITE   |
                                     IBV_ACCESS_REMOTE_ATOMIC);
 
+    System::Get().Barrier();
+// TODO: check if config is uniform -- where ?
+// it has to be fatal error, for now
+// not worry about it, its local for now
     unsigned int rdmaMemRegFlags = rdmaAccessFlags;
     if (cfg.nic.useRelaxedOrder) rdmaMemRegFlags |= IBV_ACCESS_RELAXED_ORDERING;
 
-    // Open NIC contexts
-    IBV_PTR_CALL(rss.srcContext, ibv_open_device, GetIbvDeviceList()[rss.srcNicIndex].devicePtr);
-    IBV_PTR_CALL(rss.dstContext, ibv_open_device, GetIbvDeviceList()[rss.dstNicIndex].devicePtr);
+    if (isSrc) {
+      // Open NIC contexts
+      IBV_PTR_CALL(rss.srcContext, ibv_open_device, GetIbvDeviceList()[rss.srcNicIndex].devicePtr);
 
-    // Open protection domains
-    IBV_PTR_CALL(rss.srcProtect, ibv_alloc_pd, rss.srcContext);
-    IBV_PTR_CALL(rss.dstProtect, ibv_alloc_pd, rss.dstContext);
+      // Open protection domains
+      IBV_PTR_CALL(rss.srcProtect, ibv_alloc_pd, rss.srcContext);
 
-    // Register memory region
-    IBV_PTR_CALL(rss.srcMemRegion, ibv_reg_mr, rss.srcProtect, rss.srcMem[0], rss.numBytes, rdmaMemRegFlags);
-    IBV_PTR_CALL(rss.dstMemRegion, ibv_reg_mr, rss.dstProtect, rss.dstMem[0], rss.numBytes, rdmaMemRegFlags);
+      // Register memory region
+      IBV_PTR_CALL(rss.srcMemRegion, ibv_reg_mr, rss.srcProtect, rss.srcMem[0], rss.numBytes, rdmaMemRegFlags);
 
-    // Create completion queues
-    IBV_PTR_CALL(rss.srcCompQueue, ibv_create_cq, rss.srcContext, cfg.nic.queueSize, NULL, NULL, 0);
-    IBV_PTR_CALL(rss.dstCompQueue, ibv_create_cq, rss.dstContext, cfg.nic.queueSize, NULL, NULL, 0);
+      // Create completion queues
+      IBV_PTR_CALL(rss.srcCompQueue, ibv_create_cq, rss.srcContext, cfg.nic.queueSize, NULL, NULL, 0);
 
-    // Get port attributes
-    IBV_CALL(ibv_query_port, rss.srcContext, port, &rss.srcPortAttr);
-    IBV_CALL(ibv_query_port, rss.dstContext, port, &rss.dstPortAttr);
+      // Get port attributes
+      IBV_CALL(ibv_query_port, rss.srcContext, port, &rss.srcPortAttr);
 
+      // Check for RDMA over Converged Ethernet (RoCE) and update GID index appropriately
+      isRoCE = (rss.srcPortAttr.link_layer == IBV_LINK_LAYER_ETHERNET);
+      if (isRoCE) {
+        // Try to auto-detect the GID index
+        std::pair<int, std::string> srcGidInfo (srcGidIndex, "");
+        ERR_CHECK(GetGidIndex(rss.srcContext, rss.srcPortAttr.gid_tbl_len, cfg.nic.ibPort, srcGidInfo));
+        srcGidIndex = srcGidInfo.first;
+        IBV_CALL(ibv_query_gid, rss.srcContext, port, srcGidIndex, &rss.srcGid);
+      }
 
-    if (rss.srcPortAttr.link_layer != rss.dstPortAttr.link_layer)
-      return {ERR_FATAL, "SRC NIC (%d) and DST NIC (%d) do not have the same link layer", rss.srcNicIndex, rss.dstNicIndex};
+// TODO: double check
+      // Prepare queue pairs and send elements
+      rss.srcQueuePairs.resize(rss.qpCount);
+      rss.sgePerQueuePair.resize(rss.qpCount);
+      rss.sendWorkRequests.resize(rss.qpCount);
+    }
+    if (isDst) {
+      IBV_PTR_CALL(rss.dstContext, ibv_open_device, GetIbvDeviceList()[rss.dstNicIndex].devicePtr);
+      IBV_PTR_CALL(rss.dstProtect, ibv_alloc_pd, rss.dstContext);
+      IBV_PTR_CALL(rss.dstMemRegion, ibv_reg_mr, rss.dstProtect, rss.dstMem[0], rss.numBytes, rdmaMemRegFlags);
+      IBV_PTR_CALL(rss.dstCompQueue, ibv_create_cq, rss.dstContext, cfg.nic.queueSize, NULL, NULL, 0);
+      IBV_CALL(ibv_query_port, rss.dstContext, port, &rss.dstPortAttr);
 
-    // Prepare GID index
-    int srcGidIndex = cfg.nic.ibGidIndex;
-    int dstGidIndex = cfg.nic.ibGidIndex;
+      isRoCE = (rss.dstPortAttr.link_layer == IBV_LINK_LAYER_ETHERNET);
+      if (isRoCE) {
+        std::pair<int, std::string> dstGidInfo (dstGidIndex, "");
+        ERR_CHECK(GetGidIndex(rss.dstContext, rss.dstPortAttr.gid_tbl_len, cfg.nic.ibPort, dstGidInfo));
+        dstGidIndex = dstGidInfo.first;
+        IBV_CALL(ibv_query_gid, rss.dstContext, port, dstGidIndex, &rss.dstGid);
+      }
 
-    // Check for RDMA over Converged Ethernet (RoCE) and update GID index appropriately
-    bool isRoCE = (rss.srcPortAttr.link_layer == IBV_LINK_LAYER_ETHERNET);
-    if (isRoCE) {
-      // Try to auto-detect the GID index
-      std::pair<int, std::string> srcGidInfo (srcGidIndex, "");
-      std::pair<int, std::string> dstGidInfo (dstGidIndex, "");
-      ERR_CHECK(GetGidIndex(rss.srcContext, rss.srcPortAttr.gid_tbl_len, cfg.nic.ibPort, srcGidInfo));
-      ERR_CHECK(GetGidIndex(rss.dstContext, rss.dstPortAttr.gid_tbl_len, cfg.nic.ibPort, dstGidInfo));
-      srcGidIndex = srcGidInfo.first;
-      dstGidIndex = dstGidInfo.first;
-      IBV_CALL(ibv_query_gid, rss.srcContext, port, srcGidIndex, &rss.srcGid);
-      IBV_CALL(ibv_query_gid, rss.dstContext, port, dstGidIndex, &rss.dstGid);
+      rss.dstQueuePairs.resize(rss.qpCount);
     }
 
-    // Prepare queue pairs and send elements
-    rss.srcQueuePairs.resize(rss.qpCount);
-    rss.dstQueuePairs.resize(rss.qpCount);
-    rss.sgePerQueuePair.resize(rss.qpCount);
-    rss.sendWorkRequests.resize(rss.qpCount);
+// TODO: this needs to be compared cross nodes too
+    if ((isSrc && isDst) && (rss.srcPortAttr.link_layer != rss.dstPortAttr.link_layer))
+      return {ERR_FATAL, "SRC NIC (%d) and DST NIC (%d) do not have the same link layer", rss.srcNicIndex, rss.dstNicIndex};
 
     for (int i = 0; i < rss.qpCount; ++i) {
+      if (isSrc) {
+        // Create scatter-gather element for the portion of memory assigned to this queue pair
+        ibv_sge sg = {};
+        sg.addr   = (uint64_t)rss.subExecParamCpu[i].src[0];
+        sg.length = rss.subExecParamCpu[i].N * sizeof(float);
+        sg.lkey   = rss.srcMemRegion->lkey;
+        rss.sgePerQueuePair[i] = sg;
 
-      // Create scatter-gather element for the portion of memory assigned to this queue pair
-      ibv_sge sg = {};
-      sg.addr   = (uint64_t)rss.subExecParamCpu[i].src[0];
-      sg.length = rss.subExecParamCpu[i].N * sizeof(float);
-      sg.lkey   = rss.srcMemRegion->lkey;
-      rss.sgePerQueuePair[i] = sg;
+        // Create send work request
+        ibv_send_wr wr = {};
+        wr.wr_id                = i;
+        wr.sg_list              = &rss.sgePerQueuePair[i];
+        wr.num_sge              = 1;
+        wr.opcode               = IBV_WR_RDMA_WRITE;
+        wr.send_flags           = IBV_SEND_SIGNALED;
 
-      // Create send work request
-      ibv_send_wr wr = {};
-      wr.wr_id                = i;
-      wr.sg_list              = &rss.sgePerQueuePair[i];
-      wr.num_sge              = 1;
-      wr.opcode               = IBV_WR_RDMA_WRITE;
-      wr.send_flags           = IBV_SEND_SIGNALED;
-      wr.wr.rdma.remote_addr  = (uint64_t)rss.subExecParamCpu[i].dst[0];
-      wr.wr.rdma.rkey         = rss.dstMemRegion->rkey;
-      rss.sendWorkRequests[i] = wr;
+        // Create SRC/DST queue pairs
+        ERR_CHECK(CreateQueuePair(cfg, rss.srcProtect, rss.srcCompQueue, rss.srcQueuePairs[i]));
 
-      // Create SRC/DST queue pairs
-      ERR_CHECK(CreateQueuePair(cfg, rss.srcProtect, rss.srcCompQueue, rss.srcQueuePairs[i]));
-      ERR_CHECK(CreateQueuePair(cfg, rss.dstProtect, rss.dstCompQueue, rss.dstQueuePairs[i]));
+        // Initialize SRC/DST queue pairs
+        ERR_CHECK(InitQueuePair(rss.srcQueuePairs[i], port, rdmaAccessFlags));
 
-      // Initialize SRC/DST queue pairs
-      ERR_CHECK(InitQueuePair(rss.srcQueuePairs[i], port, rdmaAccessFlags));
-      ERR_CHECK(InitQueuePair(rss.dstQueuePairs[i], port, rdmaAccessFlags));
+        ConnInfo remoteInfo;
+        if (isDst) {
+          // Directly fetch DST buffer on the same node
+          remoteInfo = {(uint64_t)rss.subExecParamCpu[i].dst[0], rss.dstMemRegion->rkey,
+                        rss.dstPortAttr.lid, rss.dstQueuePairs[i]->qp_num, rss.dstGid};
+        } else {
+          // Exchange info between SRC/DST: QP num&id, MR rkey&addr
+//TODO: invoke rank 0 here to forward socket msg
+// looping over transfer instead of executor
+          ConnInfo localInfo = {.lid = rss.srcPortAttr.lid, .qpn = rss.srcQueuePairs[i]->qp_num, .gid = rss.srcGid};
+          System::Get().RecvData(dstRank, sizeof(ConnInfo), &remoteInfo);
+          System::Get().SendData(dstRank, sizeof(ConnInfo), &localInfo);
+// Sytem::verbose
+          printf("rank %d recvd %lu, %d, %d, %d, %llu, %llu, sent %d, %d, %llu, %llu\n",
+                          GetRank(),
+                          remoteInfo.remote_addr,remoteInfo.rkey,
+                          remoteInfo.lid, remoteInfo.qpn,
+                          remoteInfo.gid.global.subnet_prefix, remoteInfo.gid.global.interface_id,
+                          localInfo.lid, localInfo.qpn,
+                          localInfo.gid.global.subnet_prefix, localInfo.gid.global.interface_id);
+        }
 
-      // Transition the SRC queue pair to ready to receive
-      ERR_CHECK(TransitionQpToRtr(rss.srcQueuePairs[i], rss.dstPortAttr.lid,
-                                  rss.dstQueuePairs[i]->qp_num, rss.dstGid,
-                                  dstGidIndex, port, isRoCE,
-                                  rss.srcPortAttr.active_mtu));
+        wr.wr.rdma.remote_addr  = remoteInfo.remote_addr;
+        wr.wr.rdma.rkey         = remoteInfo.rkey;
+        rss.sendWorkRequests[i] = wr;
+        // Transition the SRC queue pair to ready to receive
+        ERR_CHECK(TransitionQpToRtr(rss.srcQueuePairs[i], remoteInfo.lid,
+                                    remoteInfo.qpn, remoteInfo.gid,
+                                    srcGidIndex, port, isRoCE,
+                                    rss.srcPortAttr.active_mtu));
 
-      // Transition the SRC queue pair to ready to send
-      ERR_CHECK(TransitionQpToRts(rss.srcQueuePairs[i]));
+        // Transition the SRC queue pair to ready to send
+        ERR_CHECK(TransitionQpToRts(rss.srcQueuePairs[i]));
+      }
+      if (isDst) {
+        ERR_CHECK(CreateQueuePair(cfg, rss.dstProtect, rss.dstCompQueue, rss.dstQueuePairs[i]));
+        ERR_CHECK(InitQueuePair(rss.dstQueuePairs[i], port, rdmaAccessFlags));
 
-      // Transition the DST queue pair to ready to receive
-      ERR_CHECK(TransitionQpToRtr(rss.dstQueuePairs[i], rss.srcPortAttr.lid,
-                                  rss.srcQueuePairs[i]->qp_num, rss.srcGid,
-                                  srcGidIndex, port, isRoCE,
-                                  rss.dstPortAttr.active_mtu));
+        // Exchange info between SRC/DST: QP num&id, MR rkey&addr
+        ConnInfo remoteInfo;
+        if (!isSrc) {
+          ConnInfo localInfo = {(uint64_t)rss.subExecParamCpu[i].dst[0], rss.dstMemRegion->rkey,
+                                rss.dstPortAttr.lid, rss.dstQueuePairs[i]->qp_num, rss.dstGid};
+                                                            // care: is this same as MR->addr?
+          System::Get().SendData(srcRank, sizeof(ConnInfo), &localInfo);
+          System::Get().RecvData(srcRank, sizeof(ConnInfo), &remoteInfo);
+          printf("rank %d sent %lu, %d, %d, %d, %llu, %llu, recvd %d, %d, %llu, %llu\n",
+                          GetRank(),
+                          localInfo.remote_addr, localInfo.rkey,
+                          localInfo.lid, localInfo.qpn,
+                          localInfo.gid.global.subnet_prefix, localInfo.gid.global.interface_id,
+                          remoteInfo.lid, remoteInfo.qpn,
+                          remoteInfo.gid.global.subnet_prefix, remoteInfo.gid.global.interface_id);
+        } else {
+          remoteInfo.lid = rss.srcPortAttr.lid;
+          remoteInfo.qpn = rss.srcQueuePairs[i]->qp_num;
+          remoteInfo.gid = rss.srcGid;
+        }
 
-      // Transition the DST queue pair to ready to send
-      ERR_CHECK(TransitionQpToRts(rss.dstQueuePairs[i]));
+        ERR_CHECK(TransitionQpToRtr(rss.dstQueuePairs[i], remoteInfo.lid,
+                                    remoteInfo.qpn, remoteInfo.gid,
+                                    dstGidIndex, port, isRoCE,
+                                    rss.dstPortAttr.active_mtu));
+        ERR_CHECK(TransitionQpToRts(rss.dstQueuePairs[i]));
+      }
+
     }
 
     return ERR_NONE;
@@ -2484,29 +2583,34 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
 
   static ErrResult TeardownNicTransferResources(TransferResources& rss)
   {
-    // Deregister memory regions
-    IBV_CALL(ibv_dereg_mr, rss.srcMemRegion);
-    IBV_CALL(ibv_dereg_mr, rss.dstMemRegion);
+    if (rss.srcMemRegion) {
+      // Deregister memory regions
+      IBV_CALL(ibv_dereg_mr, rss.srcMemRegion);
 
-    // Destroy queue pairs
-    for (auto srcQueuePair : rss.srcQueuePairs)
-      IBV_CALL(ibv_destroy_qp, srcQueuePair);
-    rss.srcQueuePairs.clear();
-    for (auto dstQueuePair : rss.dstQueuePairs)
-      IBV_CALL(ibv_destroy_qp, dstQueuePair);
-    rss.dstQueuePairs.clear();
+      // Destroy queue pairs
+      for (auto srcQueuePair : rss.srcQueuePairs)
+        IBV_CALL(ibv_destroy_qp, srcQueuePair);
+      rss.srcQueuePairs.clear();
 
-    // Destroy completion queues
-    IBV_CALL(ibv_destroy_cq, rss.srcCompQueue);
-    IBV_CALL(ibv_destroy_cq, rss.dstCompQueue);
+      // Destroy completion queues
+      IBV_CALL(ibv_destroy_cq, rss.srcCompQueue);
 
-    // Deallocate protection domains
-    IBV_CALL(ibv_dealloc_pd, rss.srcProtect);
-    IBV_CALL(ibv_dealloc_pd, rss.dstProtect);
+      // Deallocate protection domains
+      IBV_CALL(ibv_dealloc_pd, rss.srcProtect);
 
-    // Destroy context
-    IBV_CALL(ibv_close_device, rss.srcContext);
-    IBV_CALL(ibv_close_device, rss.dstContext);
+      // Destroy context
+      IBV_CALL(ibv_close_device, rss.srcContext);
+    }
+
+    if (rss.dstMemRegion) {
+      IBV_CALL(ibv_dereg_mr, rss.dstMemRegion);
+      for (auto dstQueuePair : rss.dstQueuePairs)
+        IBV_CALL(ibv_destroy_qp, dstQueuePair);
+      rss.dstQueuePairs.clear();
+      IBV_CALL(ibv_destroy_cq, rss.dstCompQueue);
+      IBV_CALL(ibv_dealloc_pd, rss.dstProtect);
+      IBV_CALL(ibv_close_device, rss.dstContext);
+    }
 
     return ERR_NONE;
   }
@@ -2658,6 +2762,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     for (auto rss : transferResources) {
       int transferIdx = rss->transferIdx;
       Transfer const& t = transfers[transferIdx];
+      if (t.dsts[0].memRank != GetRank()) continue;
       size_t N = t.numBytes / sizeof(float);
 
       float const* expected = dstReference[t.srcs.size()].data();
@@ -2782,6 +2887,10 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       rss.srcMem.resize(t.srcs.size());
       for (int iSrc = 0; iSrc < t.srcs.size(); ++iSrc) {
         MemDevice const& srcMemDevice = t.srcs[iSrc];
+        // Skip if source memory is not on the same rank as this instance
+        // Assuming srcMemDeivce rank is same as exeDevice rank
+        if (srcMemDevice.memRank != System::Get().GetRank())
+          continue;
 
         // Ensure executing GPU can access source memory
         if (IsGpuExeType(exeDevice.exeType) && IsGpuMemType(srcMemDevice.memType) &&
@@ -2795,6 +2904,9 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       rss.dstMem.resize(t.dsts.size());
       for (int iDst = 0; iDst < t.dsts.size(); ++iDst) {
         MemDevice const& dstMemDevice = t.dsts[iDst];
+        // Skip if destination memory is not on the same rank as this instance
+        if (dstMemDevice.memRank != System::Get().GetRank())
+          continue;
 
         // Ensure executing GPU can access destination memory
         if (IsGpuExeType(exeDevice.exeType) && IsGpuMemType(dstMemDevice.memType) &&
@@ -2964,13 +3076,17 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       Transfer const& t = transfers[rss.transferIdx];
 
       // Deallocate source memory
-      for (int iSrc = 0; iSrc < t.srcs.size(); ++iSrc) {
-        ERR_CHECK(DeallocateMemory(t.srcs[iSrc].memType, rss.srcMem[iSrc], t.numBytes + cfg.data.byteOffset));
+      if (t.srcs[0].memRank == GetRank()) {
+        for (int iSrc = 0; iSrc < t.srcs.size(); ++iSrc) {
+          ERR_CHECK(DeallocateMemory(t.srcs[iSrc].memType, rss.srcMem[iSrc], t.numBytes + cfg.data.byteOffset));
+        }
       }
 
-      // Deallocate destination memory
-      for (int iDst = 0; iDst < t.dsts.size(); ++iDst) {
-        ERR_CHECK(DeallocateMemory(t.dsts[iDst].memType, rss.dstMem[iDst], t.numBytes + cfg.data.byteOffset));
+      if (t.dsts[0].memRank == GetRank()) {
+        // Deallocate destination memory
+        for (int iDst = 0; iDst < t.dsts.size(); ++iDst) {
+          ERR_CHECK(DeallocateMemory(t.dsts[iDst].memType, rss.dstMem[iDst], t.numBytes + cfg.data.byteOffset));
+        }
       }
 
       // Destroy HSA signal for DMA executor
@@ -3117,7 +3233,10 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
                                       int           const  exeIndex,
                                       TransferResources&   rss)
   {
-
+    // No actions needed for receiver node
+// max chunck size of 2G
+    if (rss.srcMemRegion == NULL)
+      return ERR_NONE;
 
     // Loop over each of the queue pairs and post the send
     ibv_send_wr* badWorkReq;
@@ -3170,7 +3289,8 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
             if (nc > 0) {
               receivedQPs[i]++;
               if (wc.status != IBV_WC_SUCCESS) {
-                return {ERR_FATAL, "Transfer %d: Received unsuccessful work completion", rss.transferIdx};
+                return {ERR_FATAL, "Transfer %d: Received unsuccessful work completion: %s",
+                                    rss.transferIdx, ibv_wc_status_str(wc.status)};
               }
             } else if (nc < 0) {
               return {ERR_FATAL, "Transfer %d: Received negative work completion", rss.transferIdx};
@@ -3821,6 +3941,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
                                ExeDevice     const& exeDevice,
                                ExeInfo&             exeInfo)
   {
+// assuming local map taken care of, and only source node is executing
     switch (exeDevice.exeType) {
     case EXE_CPU:     return RunCpuExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
     case EXE_GPU_GFX: return RunGpuExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
@@ -3993,6 +4114,8 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       // Start CPU timing for this iteration
       auto cpuStart = std::chrono::high_resolution_clock::now();
 
+// check if on the same node
+// local executor map here
       // Execute all Transfers in parallel
       std::vector<std::future<ErrResult>> asyncExecutors;
       for (auto& exeInfoPair : executorMap) {
