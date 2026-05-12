@@ -1859,6 +1859,13 @@ namespace {
       if (memDevice.memIndex < 0 || memDevice.memIndex >= numCpus)
         return {ERR_FATAL,
                 "CPU index must be between 0 and %d (instead of %d) on rank %d", numCpus - 1, memDevice.memIndex, memDevice.memRank};
+
+      // Check that this NUMA node can allocate memory
+      if (!numa_bitmask_isbitset(numa_get_mems_allowed(), memDevice.memIndex)) {
+        return {ERR_FATAL,
+          "CPU %d on rank %d has no associated memory to allocate", memDevice.memIndex, memDevice.memRank};
+      }
+
       return ERR_NONE;
     }
 
@@ -2588,7 +2595,11 @@ namespace {
       {
         // Check total number of subexecutors requested
         int numCpuSubExec = GetNumSubExecutors(exeDevice);
-        if (totalSubExecs[exeDevice] > numCpuSubExec)
+        if (numCpuSubExec == 0) {
+          errors.push_back({ERR_FATAL,
+              "CPU %d has no available cores for performing execution",
+              exeDevice.exeIndex});
+        } else if (totalSubExecs[exeDevice] > numCpuSubExec)
           errors.push_back({ERR_WARN,
                             "CPU %d requests %d total cores however only %d available. "
                             "Serialization will occur",
@@ -7753,12 +7764,26 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       // Index CPU agents
       cpuAgents.clear();
       int numCpus = numa_num_configured_nodes();
-      for (int i = 0; i < numCpus; i++) {
-        AllocateMemory({MEM_CPU, i}, 1024, (void**)&tempBuffer);
-        hsa_amd_pointer_info(tempBuffer, &info, NULL, NULL, NULL);
-        cpuAgents.push_back(info.agentOwner);
-        DeallocateMemory(MEM_CPU, tempBuffer, 1024);
-      }
+      cpuAgents.resize(numCpus, {0});
+
+      // Callback to process each agent
+      auto cpuAgentCallback = [](hsa_agent_t agent, void* data) -> hsa_status_t {
+        std::vector<hsa_agent_t>* agents = static_cast<std::vector<hsa_agent_t>*>(data);
+
+        hsa_device_type_t deviceType;
+        hsa_agent_get_info(agent, HSA_AGENT_INFO_DEVICE, &deviceType);
+
+        if (deviceType == HSA_DEVICE_TYPE_CPU) {
+          uint32_t nodeId;
+          hsa_status_t status = hsa_agent_get_info(agent, HSA_AGENT_INFO_NODE, &nodeId);
+
+          if (status == HSA_STATUS_SUCCESS && nodeId < agents->size()) {
+            (*agents)[nodeId] = agent;
+          }
+        }
+        return HSA_STATUS_SUCCESS;
+      };
+      hsa_iterate_agents(cpuAgentCallback, &cpuAgents);
 
       // Index GPU agents
       int numGpus = 0;
