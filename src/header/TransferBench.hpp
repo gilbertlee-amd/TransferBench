@@ -1029,6 +1029,8 @@ namespace {
     void BroadcastExeResult(int root, ExeResult& exeResult) const;
     void BroadcastTfrResult(int root, TransferResult& tfrResult) const;
 
+    // Returns MTYPE tag if umr is available
+    std::string GetMtypeTag(const void* ptr) const;
 
   private:
     System();
@@ -1043,6 +1045,11 @@ namespace {
     bool verbose = false;
     bool rankDoesOutput = true;
     FILE* dumpCfgFile = nullptr;
+
+    // User Mode Register Debugger (UMR) support
+    int umrVmid = 3;
+    int umrVmp = 0;
+    std::string umrBin = "/usr/local/bin/umr";
 
 #if !defined(__NVCC__)
     std::vector<hsa_agent_t> cpuAgents;
@@ -5884,19 +5891,21 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
           for (int iSrc = 0; iSrc < t.srcs.size(); ++iSrc) {
             MemDevice const& md = t.srcs[iSrc];
             std::string bdf = IsGpuMemType(md.memType) ? GetGpuBdf(md.memIndex) : "";
-            System::Get().Log("  SRC[%d]: %p  type=%-18s idx=%d NUMA=%s Rank=%d%s%s\n",
+            System::Get().Log("  SRC[%d]: %p  type=%-18s%s idx=%d NUMA=%s Rank=%d%s%s\n",
                               iSrc, transferResources[i]->srcMem[iSrc],
-                              GetMemTypeName(md.memType), md.memIndex,
-                              GetMemDeviceNuma(md).c_str(), md.memRank,
+                              GetMemTypeName(md.memType),
+                              System::Get().GetMtypeTag(transferResources[i]->srcMem[iSrc]).c_str(),
+                              md.memIndex, GetMemDeviceNuma(md).c_str(), md.memRank,
                               bdf.empty() ? "" : " BDF=", bdf.c_str());
           }
           for (int iDst = 0; iDst < t.dsts.size(); ++iDst) {
             MemDevice const& md = t.dsts[iDst];
             std::string bdf = IsGpuMemType(md.memType) ? GetGpuBdf(md.memIndex) : "";
-            System::Get().Log("  DST[%d]: %p  type=%-18s idx=%d NUMA=%s Rank=%d%s%s\n",
+            System::Get().Log("  DST[%d]: %p  type=%-18s%s idx=%d NUMA=%s Rank=%d%s%s\n",
                               iDst, transferResources[i]->dstMem[iDst],
-                              GetMemTypeName(md.memType), md.memIndex,
-                              GetMemDeviceNuma(md).c_str(), md.memRank,
+                              GetMemTypeName(md.memType),
+                              System::Get().GetMtypeTag(transferResources[i]->dstMem[iDst]).c_str(),
+                              md.memIndex, GetMemDeviceNuma(md).c_str(), md.memRank,
                               bdf.empty() ? "" : " BDF=", bdf.c_str());
           }
         }
@@ -6525,9 +6534,36 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     // TB_SINGLE_LOG    = Only rank 0 will produce output (useful if spawning multi-node socket)
     // TB_DUMP_CFG_FILE = Config file to dump executed Transfers
     // TB_PAUSE         = Insert a pause for debug attachment
+    // TB_UMR_BIN       = Path to umr binary file
+    // TB_UMR_VMID      = VMID to use when using umr
+    // TB_UMR_VMP       = VMP to use when using umr
 
     verbose = getenv("TB_VERBOSE") ? atoi(getenv("TB_VERBOSE")) : 0;
     bool singleLog = getenv("TB_SINGLE_LOG") ? atoi(getenv("TB_SINGLE_LOG")) : 0;
+
+    if (verbose) {
+      Log("[INFO] TransferBench launched with PID %d\n", getpid());
+    }
+
+    if (char const* b = getenv("TB_UMR_BIN")) {
+      umrBin = b;
+    }
+    if (verbose) {
+      if (access(umrBin.c_str(), X_OK) != 0) {
+        Log("[INFO] UMR (at %s) not executable; MTYPE probing requires UMR (at TB_UMR_BIN), valid TB_UMR_VMID and root access",
+            umrBin.c_str());
+      } else {
+        Log("[INFO] Found UMR at %s\n", umrBin.c_str());
+      }
+    }
+
+    if (char const *b = getenv("TB_UMR_VMP")) {
+      umrVmp = atoi(b);
+    }
+
+    if (char const *b = getenv("TB_UMR_VID")) {
+      umrVmid = atoi(b);
+    }
 
     char* dumpCfgFilename = getenv("TB_DUMP_CFG_FILE");
     if (dumpCfgFilename) {
@@ -7937,6 +7973,38 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     if (targetRank < 0 || targetRank >= numRanks) targetRank = rank;
     if (rankInfo[targetRank].nicIsActive.count(nicIndex) == 0) return 0;
     return rankInfo[targetRank].nicIsActive.at(nicIndex);
+  }
+
+  std::string System::GetMtypeTag(void const* va) const
+  {
+    char cmd[512];
+    std::snprintf(cmd, sizeof(cmd),
+                  "%s -vmp %d --vm-decode %d@0x%lx 2>/dev/null",
+                  umrBin.c_str(), umrVmp, umrVmid,
+                  reinterpret_cast<uintptr_t>(va));
+    if (verbose) {
+      Log("[INFO] Attempted to detected MTYPE via: %s\n", cmd);
+    }
+
+    FILE* pipe = popen(cmd, "r");
+    if (!pipe) return " [MTYPE=?]";
+
+    std::string result = " [MTYPE=?]";
+    char line[1024];
+    while (std::fgets(line, sizeof(line), pipe)) {
+      if (std::strstr(line, "PTE@") == nullptr) continue;
+      char const* p = std::strstr(line, "MTYPE=");
+      if (!p) continue;
+      p += 6;
+      char val[32] = {0};
+      int i = 0;
+      while (*p && *p != ',' && *p != '\n' && *p != ' ' && i < 31)
+        val[i++] = *p++;
+      if (i > 0) result = std::string(" [MTYPE=") + val + "]";
+      break;
+    }
+    pclose(pipe);
+    return result;
   }
 
   int GetNumExecutors(ExeType exeType, int targetRank)
