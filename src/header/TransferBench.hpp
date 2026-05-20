@@ -627,7 +627,9 @@ namespace TransferBench
   #define hipMemcpyDeviceToHost                              cudaMemcpyDeviceToHost
   #define hipMemcpyHostToDevice                              cudaMemcpyHostToDevice
   #define hipSuccess                                         cudaSuccess
+  #define hipMemLocation                                     CUmemLocation
   #define hipMemLocationTypeDevice                           CU_MEM_LOCATION_TYPE_DEVICE
+  #define hipMemLocationTypeHostNuma                         CU_MEM_LOCATION_TYPE_HOST_NUMA
   #define hipMemAllocationTypePinned                         CU_MEM_ALLOCATION_TYPE_PINNED
   #define hipMemHandleTypeFabric                             CU_MEM_HANDLE_TYPE_FABRIC
   #define hipMemAllocationGranularityRecommended             CU_MEM_ALLOC_GRANULARITY_RECOMMENDED
@@ -1411,6 +1413,25 @@ namespace {
   }
 
 #ifdef POD_COMM_ENABLED
+  static ErrResult GetMemLocation(MemDevice const& memDevice, hipMemLocation& location)
+  {
+    if (IsCpuMemType(memDevice.memType)) {
+      location.type = hipMemLocationTypeHostNuma;
+    } else if (IsGpuMemType(memDevice.memType) && memDevice.memType != MEM_MANAGED) {
+      location.type = hipMemLocationTypeDevice;
+    } else {
+      return {ERR_FATAL, "Unsupported memory location"};
+    }
+
+    // Determine location id
+    if (memDevice.memType == MEM_CPU_CLOSEST) {
+      location.id = GetClosestCpuNumaToGpu(memDevice.memIndex);
+    } else {
+      location.id = memDevice.memIndex;
+    }
+    return ERR_NONE;
+  }
+
   static ErrResult GetMemAllocationProp(MemDevice const& memDevice, hipMemAllocationProp& prop)
   {
 
@@ -1428,10 +1449,7 @@ namespace {
     }
 
     prop.requestedHandleTypes = hipMemHandleTypeFabric;
-//  at this point shouldn't have any memtype other than device
-//    ERR_CHECK(GetMemLocation(memDevice, prop.location));
-    prop.location.type = hipMemLocationTypeDevice;
-    prop.location.id = memDevice.memIndex;
+    ERR_CHECK(GetMemLocation(memDevice, prop.location));
     return ERR_NONE;
   }
 #endif
@@ -1495,6 +1513,14 @@ namespace {
       deviceIdx = GetClosestCpuNumaToGpu(memDevice.memIndex);
     }
 
+    if (IsCpuMemType(memType)) {
+      // Set NUMA policy prior to call to hipHostMalloc
+      numa_set_preferred(deviceIdx);
+    } else {
+      // Switch to the appropriate GPU
+      ERR_CHECK(hipSetDevice(deviceIdx));
+    }
+
     // If memHandle is provided, allocate sharable memory
     if (memHandle != NULL) {
 #ifdef POD_COMM_ENABLED
@@ -1519,21 +1545,21 @@ namespace {
 
       // Specify memory access descriptor to enable local read/write
       hipMemAccessDesc desc;
-//      ERR_CHECK(GetMemLocation(memDevice, desc.location));
-      desc.location.type = hipMemLocationTypeDevice;
-      desc.location.id = memDevice.memIndex;
       desc.flags = hipMemAccessFlagsProtReadWrite;
-
-      // Set access flags for virtual address range
-      ERR_CHECK(hipMemSetAccess((gpu_device_ptr)*memPtr, roundedUpBytes, &desc, 1));
 
       // Clear the memory
       if (IsCpuMemType(memType)) {
+        // Grant CPU access to this memory
+        desc.location.type = hipMemLocationTypeHostNuma;
+        ERR_CHECK(hipMemSetAccess((gpu_device_ptr)*memPtr, roundedUpBytes, &desc, 1));
+
         memset(*memPtr, 0, roundedUpBytes);
         // Check that the allocated pages are actually on the correct NUMA node
         ERR_CHECK(CheckPages((char*)*memPtr, roundedUpBytes, deviceIdx));
       } else if (IsGpuMemType(memType)) {
-        ERR_CHECK(hipSetDevice(memDevice.memIndex));
+        // Grant GPU access to this memory
+        desc.location.type = hipMemLocationTypeDevice;
+        ERR_CHECK(hipMemSetAccess((gpu_device_ptr)*memPtr, roundedUpBytes, &desc, 1));
         ERR_CHECK(hipMemset(*memPtr, 0, numBytes));
         ERR_CHECK(hipDeviceSynchronize());
       }
@@ -1546,9 +1572,6 @@ namespace {
     }
 
     if (IsCpuMemType(memType)) {
-
-      // Set NUMA policy prior to call to hipHostMalloc
-      numa_set_preferred(deviceIdx);
 
       // Allocate host-pinned memory (should respect NUMA mem policy)
       int flags = 0;
@@ -1590,8 +1613,6 @@ namespace {
       // Reset to default numa mem policy
       numa_set_preferred(-1);
     } else if (IsGpuMemType(memType)) {
-      // Switch to the appropriate GPU
-      ERR_CHECK(hipSetDevice(memDevice.memIndex));
 
       if (memType == MEM_GPU) {
         // Allocate GPU memory on appropriate device
@@ -8106,9 +8127,10 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
 #undef hipMemcpyDeviceToHost
 #undef hipMemcpyHostToDevice
 #undef hipSuccess
+#undef hipMemLocation
 #undef hipMemLocationTypeDevice
+#undef hipMemLocationTypeHostNuma
 #undef hipMemAllocationTypePinned
-//#undef hipMemAllocationTypeUncached
 #undef hipMemHandleTypeFabric
 #undef hipMemAllocationGranularityRecommended
 #undef hipMemAccessFlagsProtReadWrite
